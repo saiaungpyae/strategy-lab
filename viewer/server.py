@@ -29,6 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE.parent / "data"
@@ -39,6 +40,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 # Reuse the exact indicator + signal code the backtests use, so overlaid
 # samples match what the backtests in strategylab.backtest actually traded.
 from strategylab.core import Indicators, supertrend_dir  # noqa: E402
+from strategylab.backtest.fvg import FVGParams, run_fvg_study  # noqa: E402
 
 # Cache raw CSV loads so repeated requests / bar-count changes are instant.
 # Keyed by (path, mtime) so a re-fetched file is picked up automatically.
@@ -81,6 +83,30 @@ def safe_data_path(filename: str) -> Path | None:
     return candidate
 
 
+# ----------------------------------------------------------------------------
+# US equity session shading — 09:30–16:00 America/New_York, weekdays.
+# zoneinfo handles the EST/EDT daylight-saving switch, so the UTC candle
+# timestamps land on the right wall-clock hours year-round.
+# ----------------------------------------------------------------------------
+NY_TZ = ZoneInfo("America/New_York")
+SESSION_RTH_COLOR = "rgba(59,130,246,0.14)"    # regular hours 09:30–16:00 ET
+SESSION_OPEN_COLOR = "rgba(240,180,41,0.22)"   # opening hour 09:30–10:30 ET
+
+
+def us_session_bars(times: pd.Series) -> list[dict]:
+    """Histogram items (full-height background bands) for bars inside US RTH."""
+    et = pd.to_datetime(times, unit="s", utc=True).dt.tz_convert(NY_TZ)
+    minutes = et.dt.hour * 60 + et.dt.minute
+    weekday = et.dt.weekday < 5           # NYSE holidays are not modeled
+    rth = weekday & (minutes >= 9 * 60 + 30) & (minutes < 16 * 60)
+    open_hour = rth & (minutes < 10 * 60 + 30)
+    return [
+        {"time": int(t), "value": 1,
+         "color": SESSION_OPEN_COLOR if o else SESSION_RTH_COLOR}
+        for t, r, o in zip(times, rth, open_hour) if r
+    ]
+
+
 def candles_payload(filename: str, bars: int) -> dict:
     path = safe_data_path(filename)
     if path is None:
@@ -106,6 +132,7 @@ def candles_payload(filename: str, bars: int) -> dict:
         "total": total,
         "candles": candles,
         "volume": volume,
+        "session": us_session_bars(df["time"]),
     }
 
 
@@ -190,6 +217,56 @@ def signals_payload(filename: str, bars: int, strategy: str) -> dict:
     }
 
 
+# ----------------------------------------------------------------------------
+# FVG event study — zones + per-trade outcomes + summary vs the random control.
+# Cached per (file, mtime, rr) because the study walks every gap in Python.
+# ----------------------------------------------------------------------------
+@lru_cache(maxsize=8)
+def _fvg_study(path_str: str, mtime: float, rr: float):
+    df = pd.read_csv(path_str)
+    return run_fvg_study(df, FVGParams(rr=rr))
+
+
+def fvg_payload(filename: str, bars: int, rr: float) -> dict:
+    path = safe_data_path(filename)
+    if path is None:
+        return {"error": f"file not found: {filename}"}
+    events, summary = _fvg_study(str(path), path.stat().st_mtime, rr)
+
+    df = load_df(path)
+    times = df["time"].to_numpy()
+    n = len(times)
+    lo = n - bars if 0 < bars < n else 0
+
+    zones, markers = [], []
+    for ev in events:
+        # include any event still active or resolving inside the visible window
+        end_idx = ev.resolve_idx if ev.resolve_idx is not None else min(ev.form_idx + 50, n - 1)
+        if end_idx < lo:
+            continue
+        zones.append({
+            "from": int(times[ev.form_idx]),
+            "to": int(times[end_idx]),
+            "top": ev.top,
+            "bottom": ev.bottom,
+            "dir": ev.direction,
+            "outcome": ev.outcome,
+        })
+        if ev.touch_idx is not None and ev.touch_idx >= lo:
+            tag = {"win": "W", "loss": "L", "timeout": "T", "open": "?"}[ev.outcome]
+            color = {"win": "#26a69a", "loss": "#ef5350",
+                     "timeout": "#f0b429", "open": "#8b949e"}[ev.outcome]
+            markers.append({
+                "time": int(times[ev.touch_idx]),
+                "position": "belowBar" if ev.direction > 0 else "aboveBar",
+                "color": color,
+                "shape": "arrowUp" if ev.direction > 0 else "arrowDown",
+                "text": tag,
+            })
+    markers.sort(key=lambda m: m["time"])
+    return {"file": filename, "zones": zones, "markers": markers, "summary": summary}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
@@ -233,6 +310,22 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError:
                 bars = 5000
             payload = signals_payload(filename, bars, strategy)
+            status = 404 if "error" in payload else 200
+            return self._send_json(payload, status)
+
+        if route == "/api/fvg":
+            q = parse_qs(parsed.query)
+            filename = (q.get("file") or [""])[0]
+            try:
+                bars = int((q.get("bars") or ["5000"])[0])
+            except ValueError:
+                bars = 5000
+            try:
+                rr = float((q.get("rr") or ["2.0"])[0])
+            except ValueError:
+                rr = 2.0
+            rr = min(max(rr, 0.5), 10.0)
+            payload = fvg_payload(filename, bars, rr)
             status = 404 if "error" in payload else 200
             return self._send_json(payload, status)
 

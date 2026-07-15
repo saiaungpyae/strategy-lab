@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "candle-viewer",
-      "runtimeExecutable": ".venv/bin/python",
+      "runtimeExecutable": "/Users/Sai/Documents/projects/strategy-lab/.venv/bin/python",
       "runtimeArgs": ["viewer/server.py"],
       "port": 8000,
       "autoPort": true

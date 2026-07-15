@@ -27,9 +27,33 @@
   }
   select:hover, button:hover { border-color: #3d444d; }
   .spacer { flex: 1; }
+  .check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .check input { accent-color: #3b82f6; cursor: pointer; }
   #meta { color: var(--muted); font-size: 12px; }
   #status { color: var(--muted); font-size: 12px; min-width: 90px; }
-  #chart { width: 100vw; height: calc(100vh - 52px); }
+  #chart { width: 100vw; height: calc(100vh - 52px); position: relative; }
+  #fvgCanvas {
+    position: absolute; top: 0; left: 0; z-index: 3; pointer-events: none;
+  }
+  #fvgPanel {
+    position: absolute; top: 62px; right: 76px; z-index: 5; display: none;
+    background: rgba(22,27,34,0.92); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; font-size: 12px; min-width: 250px;
+    font-variant-numeric: tabular-nums;
+  }
+  #fvgPanel h2 { font-size: 12px; margin: 0 0 6px; font-weight: 600; }
+  #fvgPanel table { border-collapse: collapse; width: 100%; }
+  #fvgPanel td { padding: 1.5px 0; color: var(--muted); }
+  #fvgPanel td:last-child { text-align: right; color: var(--text); }
+  .verdict {
+    margin-top: 8px; padding: 5px 8px; border-radius: 6px; font-weight: 600;
+    text-align: center; font-size: 11.5px;
+  }
+  .verdict.pass  { background: rgba(38,166,154,0.15);  color: #26a69a; }
+  .verdict.mixed { background: rgba(240,180,41,0.15);  color: #f0b429; }
+  .verdict.weak  { background: rgba(240,180,41,0.12);  color: #d9a521; }
+  .verdict.fail  { background: rgba(239,83,80,0.15);   color: #ef5350; }
+  .verdict.none  { background: rgba(139,148,158,0.15); color: #8b949e; }
   .ohlc {
     position: absolute; top: 62px; left: 20px; z-index: 5;
     background: rgba(22,27,34,0.85); border: 1px solid var(--border);
@@ -53,20 +77,38 @@
     <option value="20000">20,000</option>
     <option value="0">all</option>
   </select>
+  <label class="check" title="Regular US trading hours 09:30–16:00 New York time (blue), opening hour emphasized (amber). Follows EST/EDT daylight saving automatically.">
+    <input type="checkbox" id="session" checked />US session
+  </label>
   <label>signals</label>
   <select id="signals">
     <option value="none" selected>none</option>
     <option value="ema_cross">EMA cross 12/26 · trend</option>
     <option value="sma_cross">SMA cross 50/200 · trend</option>
     <option value="supertrend">Supertrend · trend</option>
+    <option value="fvg">FVG · gap-fill event study</option>
   </select>
+  <label id="rrLabel" style="display:none">target R:R</label>
+  <select id="rr" style="display:none">
+    <option value="1">1 : 1</option>
+    <option value="1.5">1.5 : 1</option>
+    <option value="2" selected>2 : 1</option>
+    <option value="3">3 : 1</option>
+  </select>
+  <label class="check" id="fvgMarkersLabel" style="display:none"
+         title="Arrows at each gap-entry bar: W win, L loss, T timeout">
+    <input type="checkbox" id="fvgMarkers" />entry markers
+  </label>
   <button id="reload">reload</button>
   <span id="meta"></span>
   <span class="spacer"></span>
   <span id="status"></span>
 </header>
-<div id="chart"></div>
+<div id="chart">
+  <canvas id="fvgCanvas"></canvas>
+</div>
 <div class="ohlc" id="ohlc"></div>
+<div id="fvgPanel"></div>
 
 <script>
 const { createChart } = LightweightCharts;
@@ -79,6 +121,16 @@ const chart = createChart(el, {
   crosshair: { mode: 1 },
   autoSize: true,
 });
+
+// Full-height translucent bands marking the US cash session (09:30–16:00 ET,
+// opening hour emphasized). Added before the candles so it draws behind them;
+// value=1 on a hidden 0-margin scale makes each bar span the whole pane.
+const sessionSeries = chart.addHistogramSeries({
+  priceScaleId: 'session',
+  priceLineVisible: false, lastValueVisible: false,
+  priceFormat: { type: 'volume' },
+});
+sessionSeries.priceScale().applyOptions({ scaleMargins: { top: 0, bottom: 0 }, visible: false });
 
 const candleSeries = chart.addCandlestickSeries({
   upColor: '#26a69a', downColor: '#ef5350',
@@ -93,11 +145,19 @@ volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } 
 const $file = document.getElementById('file');
 const $bars = document.getElementById('bars');
 const $signals = document.getElementById('signals');
+const $rr = document.getElementById('rr');
+const $rrLabel = document.getElementById('rrLabel');
+const $fvgMarkers = document.getElementById('fvgMarkers');
+const $fvgMarkersLabel = document.getElementById('fvgMarkersLabel');
 const $status = document.getElementById('status');
 const $meta = document.getElementById('meta');
 const $ohlc = document.getElementById('ohlc');
+const $session = document.getElementById('session');
+const $fvgPanel = document.getElementById('fvgPanel');
+const fvgCanvas = document.getElementById('fvgCanvas');
 
 let overlaySeries = [];  // indicator lines currently drawn on the chart
+let sessionBars = [];    // US-session background bands for the loaded window
 
 function fmt(n) { return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
 
@@ -123,6 +183,8 @@ async function loadCandles() {
     if (d.error) { $status.textContent = d.error; return; }
     candleSeries.setData(d.candles);
     volumeSeries.setData(d.volume);
+    sessionBars = d.session || [];
+    sessionSeries.setData($session.checked ? sessionBars : []);
     chart.timeScale().fitContent();
     $meta.textContent = `${fmt(d.returned)} of ${fmt(d.total)} candles`;
     $status.textContent = 'ready';
@@ -136,12 +198,17 @@ function clearOverlays() {
   for (const s of overlaySeries) chart.removeSeries(s);
   overlaySeries = [];
   candleSeries.setMarkers([]);
+  fvgClear();
 }
 
 async function loadSignals() {
   clearOverlays();
   const strat = $signals.value;
+  const isFvg = strat === 'fvg';
+  $rr.style.display = $rrLabel.style.display = isFvg ? '' : 'none';
+  $fvgMarkersLabel.style.display = isFvg ? '' : 'none';
   if (strat === 'none') return;
+  if (isFvg) return loadFVG();
   const file = $file.value, bars = $bars.value;
   if (!file) return;
   try {
@@ -162,23 +229,143 @@ async function loadSignals() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FVG event study — gap zones on a canvas overlay + stats panel.
+// Zone fill = trade outcome: green win, red loss, yellow timeout, gray untouched.
+// ---------------------------------------------------------------------------
+let fvgZones = [];
+let fvgMarkerData = [];  // W/L/T entry arrows — shown only when the toggle is on
+
+const FVG_FILL = {
+  win:       'rgba(38,166,154,0.20)',
+  loss:      'rgba(239,83,80,0.20)',
+  timeout:   'rgba(240,180,41,0.16)',
+  open:      'rgba(139,148,158,0.16)',
+  untouched: 'rgba(139,148,158,0.09)',
+};
+const FVG_EDGE = {
+  win:       'rgba(38,166,154,0.55)',
+  loss:      'rgba(239,83,80,0.55)',
+  timeout:   'rgba(240,180,41,0.45)',
+  open:      'rgba(139,148,158,0.45)',
+  untouched: 'rgba(139,148,158,0.25)',
+};
+
+function fvgClear() {
+  fvgZones = [];
+  fvgMarkerData = [];
+  $fvgPanel.style.display = 'none';
+  const ctx = fvgCanvas.getContext('2d');
+  ctx.clearRect(0, 0, fvgCanvas.width, fvgCanvas.height);
+}
+
+function drawZones() {
+  const dpr = window.devicePixelRatio || 1;
+  fvgCanvas.width = el.clientWidth * dpr;
+  fvgCanvas.height = el.clientHeight * dpr;
+  fvgCanvas.style.width = el.clientWidth + 'px';
+  fvgCanvas.style.height = el.clientHeight + 'px';
+  const ctx = fvgCanvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, el.clientWidth, el.clientHeight);
+  if (!fvgZones.length) return;
+
+  const ts = chart.timeScale();
+  const vr = ts.getVisibleRange();
+  if (!vr) return;
+
+  for (const z of fvgZones) {
+    if (z.to < vr.from || z.from > vr.to) continue;
+    const x1 = ts.timeToCoordinate(Math.max(z.from, vr.from));
+    const x2 = ts.timeToCoordinate(Math.min(z.to, vr.to));
+    const y1 = candleSeries.priceToCoordinate(z.top);
+    const y2 = candleSeries.priceToCoordinate(z.bottom);
+    if (x1 == null || x2 == null || y1 == null || y2 == null) continue;
+    const w = Math.max(x2 - x1, 2), h = Math.max(y2 - y1, 1);
+    ctx.fillStyle = FVG_FILL[z.outcome] || FVG_FILL.untouched;
+    ctx.fillRect(x1, y1, w, h);
+    ctx.strokeStyle = FVG_EDGE[z.outcome] || FVG_EDGE.untouched;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x1 + 0.5, y1 + 0.5, w - 1, h - 1);
+  }
+}
+
+function pct(x, digits = 1) { return (x * 100).toFixed(digits) + '%'; }
+
+function renderFvgPanel(s) {
+  const rows = [
+    ['gaps found', `${fmt(s.gaps)} (${fmt(s.bull)}▲ / ${fmt(s.bear)}▼)`],
+    ['frequency', `${s.gaps_per_day.toFixed(1)} / day`],
+    ['touched (filled)', `${fmt(s.touched)} · ${pct(s.touch_rate, 0)}`],
+    ['wins / losses / timeouts', `${fmt(s.wins)} / ${fmt(s.losses)} / ${fmt(s.timeouts)}`],
+    ['win rate', pct(s.win_rate)],
+    ['random baseline', s.control_win_rate == null ? '—'
+        : `${pct(s.control_win_rate)} ± ${pct(s.control_sd)}`],
+    ['FVG vs random', s.percentile_vs_random == null ? '—'
+        : `${Math.round(s.percentile_vs_random * 100)}th pctile`],
+    ['avg net / trade', pct(s.avg_net_pct, 3)],
+    ['avg R (gross)', s.avg_r.toFixed(2)],
+  ];
+  $fvgPanel.innerHTML =
+    `<h2>FVG event study · full history</h2><table>` +
+    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('') +
+    `</table><div class="verdict ${s.grade}">${s.verdict}</div>`;
+  $fvgPanel.style.display = 'block';
+}
+
+async function loadFVG() {
+  const file = $file.value, bars = $bars.value, rr = $rr.value;
+  if (!file) return;
+  $status.textContent = 'running FVG study… (first run on a big file takes a while)';
+  try {
+    const r = await fetch(`/api/fvg?file=${encodeURIComponent(file)}&bars=${bars}&rr=${rr}`);
+    const d = await r.json();
+    if (d.error) { $status.textContent = d.error; return; }
+    fvgZones = d.zones;
+    fvgMarkerData = d.markers;
+    candleSeries.setMarkers($fvgMarkers.checked ? fvgMarkerData : []);
+    renderFvgPanel(d.summary);
+    drawZones();
+    $meta.textContent = `FVG — ${fmt(d.zones.length)} zones in view · stats cover full history`;
+    $status.textContent = 'ready';
+  } catch (e) {
+    $status.textContent = 'error: ' + e.message;
+  }
+}
+
+chart.timeScale().subscribeVisibleTimeRangeChange(drawZones);
+new ResizeObserver(drawZones).observe(el);
+$rr.onchange = loadSignals;
+$fvgMarkers.onchange = () =>
+  candleSeries.setMarkers($fvgMarkers.checked ? fvgMarkerData : []);
+
+// New York wall-clock formatter — Intl applies the EST/EDT switch for us,
+// and timeZoneName shows which one is in effect on that bar.
+const etFmt = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', weekday: 'short', month: 'short', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short',
+});
+
 // Live OHLC readout on crosshair move
 chart.subscribeCrosshairMove(param => {
   const c = param.seriesData && param.seriesData.get(candleSeries);
   if (!c) { $ohlc.style.display = 'none'; return; }
   const cls = c.close >= c.open ? 'up' : 'down';
+  const et = typeof param.time === 'number'
+    ? `<span style="color:var(--muted)">${etFmt.format(new Date(param.time * 1000))}</span>` : '';
   $ohlc.style.display = 'block';
   $ohlc.innerHTML =
     `<span>O <b class="${cls}">${fmt(c.open)}</b></span>` +
     `<span>H <b class="${cls}">${fmt(c.high)}</b></span>` +
     `<span>L <b class="${cls}">${fmt(c.low)}</b></span>` +
-    `<span>C <b class="${cls}">${fmt(c.close)}</b></span>`;
+    `<span>C <b class="${cls}">${fmt(c.close)}</b></span>` + et;
 });
 
 document.getElementById('reload').onclick = loadCandles;
 $file.onchange = loadCandles;
 $bars.onchange = loadCandles;
 $signals.onchange = loadSignals;
+$session.onchange = () => sessionSeries.setData($session.checked ? sessionBars : []);
 loadFiles();
 </script>
 </body>
