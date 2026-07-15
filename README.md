@@ -1,4 +1,4 @@
-# crypto-2026 — a local crypto backtesting lab
+# strategy-lab — a local crypto backtesting lab
 
 A self-contained toolkit for fetching historical crypto candles and stress-testing
 trading strategies offline — with a strong bias toward **honest, anti-overfit
