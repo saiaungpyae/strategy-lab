@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>crypto-2026 · candle viewer</title>
+<script src="/lightweight-charts.js"></script>
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b22; --border: #2a2f38;
+    --text: #e6edf3; --muted: #8b949e; --accent: #26a69a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  label { color: var(--muted); font-size: 12px; }
+  select, button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+  }
+  select:hover, button:hover { border-color: #3d444d; }
+  .spacer { flex: 1; }
+  #meta { color: var(--muted); font-size: 12px; }
+  #status { color: var(--muted); font-size: 12px; min-width: 90px; }
+  #chart { width: 100vw; height: calc(100vh - 52px); }
+  .ohlc {
+    position: absolute; top: 62px; left: 20px; z-index: 5;
+    background: rgba(22,27,34,0.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; pointer-events: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .ohlc span { margin-right: 10px; }
+  .up { color: #26a69a; } .down { color: #ef5350; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 candle viewer</h1>
+  <label>dataset</label>
+  <select id="file"></select>
+  <label>bars</label>
+  <select id="bars">
+    <option value="500">500</option>
+    <option value="2000">2,000</option>
+    <option value="5000" selected>5,000</option>
+    <option value="20000">20,000</option>
+    <option value="0">all</option>
+  </select>
+  <label>signals</label>
+  <select id="signals">
+    <option value="none" selected>none</option>
+    <option value="ema_cross">EMA cross 12/26 · trend</option>
+    <option value="sma_cross">SMA cross 50/200 · trend</option>
+    <option value="supertrend">Supertrend · trend</option>
+  </select>
+  <button id="reload">reload</button>
+  <span id="meta"></span>
+  <span class="spacer"></span>
+  <span id="status"></span>
+</header>
+<div id="chart"></div>
+<div class="ohlc" id="ohlc"></div>
+
+<script>
+const { createChart } = LightweightCharts;
+const el = document.getElementById('chart');
+const chart = createChart(el, {
+  layout: { background: { color: '#0e1117' }, textColor: '#e6edf3' },
+  grid: { vertLines: { color: '#1c2027' }, horzLines: { color: '#1c2027' } },
+  rightPriceScale: { borderColor: '#2a2f38' },
+  timeScale: { borderColor: '#2a2f38', timeVisible: true, secondsVisible: false },
+  crosshair: { mode: 1 },
+  autoSize: true,
+});
+
+const candleSeries = chart.addCandlestickSeries({
+  upColor: '#26a69a', downColor: '#ef5350',
+  borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+  wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+});
+const volumeSeries = chart.addHistogramSeries({
+  priceFormat: { type: 'volume' }, priceScaleId: '',
+});
+volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+const $file = document.getElementById('file');
+const $bars = document.getElementById('bars');
+const $signals = document.getElementById('signals');
+const $status = document.getElementById('status');
+const $meta = document.getElementById('meta');
+const $ohlc = document.getElementById('ohlc');
+
+let overlaySeries = [];  // indicator lines currently drawn on the chart
+
+function fmt(n) { return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+
+async function loadFiles() {
+  const files = await (await fetch('/api/files')).json();
+  $file.innerHTML = '';
+  for (const f of files) {
+    const opt = document.createElement('option');
+    opt.value = f.file; opt.textContent = f.label;
+    $file.appendChild(opt);
+  }
+  if (files.length) loadCandles();
+  else $status.textContent = 'no datasets in data/';
+}
+
+async function loadCandles() {
+  const file = $file.value, bars = $bars.value;
+  if (!file) return;
+  $status.textContent = 'loading…';
+  try {
+    const r = await fetch(`/api/candles?file=${encodeURIComponent(file)}&bars=${bars}`);
+    const d = await r.json();
+    if (d.error) { $status.textContent = d.error; return; }
+    candleSeries.setData(d.candles);
+    volumeSeries.setData(d.volume);
+    chart.timeScale().fitContent();
+    $meta.textContent = `${fmt(d.returned)} of ${fmt(d.total)} candles`;
+    $status.textContent = 'ready';
+    await loadSignals();  // redraw overlay for the new file/bars window
+  } catch (e) {
+    $status.textContent = 'error: ' + e.message;
+  }
+}
+
+function clearOverlays() {
+  for (const s of overlaySeries) chart.removeSeries(s);
+  overlaySeries = [];
+  candleSeries.setMarkers([]);
+}
+
+async function loadSignals() {
+  clearOverlays();
+  const strat = $signals.value;
+  if (strat === 'none') return;
+  const file = $file.value, bars = $bars.value;
+  if (!file) return;
+  try {
+    const r = await fetch(`/api/signals?file=${encodeURIComponent(file)}&strategy=${strat}&bars=${bars}`);
+    const d = await r.json();
+    if (d.error) { $status.textContent = d.error; return; }
+    for (const ln of d.lines) {
+      const s = chart.addLineSeries({
+        color: ln.color, lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
+      });
+      s.setData(ln.data);
+      overlaySeries.push(s);
+    }
+    candleSeries.setMarkers(d.markers);
+    $meta.textContent = `${d.label} — ${fmt(d.entries)} entries · ${fmt(d.exits)} exits`;
+  } catch (e) {
+    $status.textContent = 'error: ' + e.message;
+  }
+}
+
+// Live OHLC readout on crosshair move
+chart.subscribeCrosshairMove(param => {
+  const c = param.seriesData && param.seriesData.get(candleSeries);
+  if (!c) { $ohlc.style.display = 'none'; return; }
+  const cls = c.close >= c.open ? 'up' : 'down';
+  $ohlc.style.display = 'block';
+  $ohlc.innerHTML =
+    `<span>O <b class="${cls}">${fmt(c.open)}</b></span>` +
+    `<span>H <b class="${cls}">${fmt(c.high)}</b></span>` +
+    `<span>L <b class="${cls}">${fmt(c.low)}</b></span>` +
+    `<span>C <b class="${cls}">${fmt(c.close)}</b></span>`;
+});
+
+document.getElementById('reload').onclick = loadCandles;
+$file.onchange = loadCandles;
+$bars.onchange = loadCandles;
+$signals.onchange = loadSignals;
+loadFiles();
+</script>
+</body>
+</html>

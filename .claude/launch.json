@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "candle-viewer",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["viewer/server.py"],
+      "port": 8000,
+      "autoPort": true
+    },
+    {
+      "name": "report-server",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["-m", "http.server", "8010"],
+      "port": 8010,
+      "autoPort": true
+    }
+  ]
+}
