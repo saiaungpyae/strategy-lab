@@ -32,8 +32,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators
-from scalp_lab import BARS_PER_DAY
+from strategylab.core import Indicators
+from strategylab.strategies.scalp import BARS_PER_DAY
 
 DAILY_TARGET = 0.0003  # 0.03%/day
 

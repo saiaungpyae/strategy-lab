@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators, PPY
+from strategylab.core import Indicators, PPY
 
 # Execution assumptions (identical to maker_backtest.py so numbers reconcile).
 TAKER_FEE = 0.001      # 0.10% per side, market orders

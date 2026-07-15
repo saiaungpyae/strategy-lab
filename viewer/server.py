@@ -37,9 +37,8 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 
 # Reuse the exact indicator + signal code the backtests use, so overlaid
-# samples match what maker_backtest.py / strategy_lab.py actually traded.
-sys.path.insert(0, str(HERE.parent))
-from strategy_lab import Indicators, supertrend_dir  # noqa: E402
+# samples match what the backtests in strategylab.backtest actually traded.
+from strategylab.core import Indicators, supertrend_dir  # noqa: E402
 
 # Cache raw CSV loads so repeated requests / bar-count changes are instant.
 # Keyed by (path, mtime) so a re-fetched file is picked up automatically.

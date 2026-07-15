@@ -29,7 +29,7 @@ from pathlib import Path
 import pandas as pd
 from backtesting import Backtest
 
-from bt_strategies import STRATEGIES
+from strategylab.strategies.community import STRATEGIES
 
 warnings.filterwarnings("ignore")  # backtesting emits noisy user-warnings on some stats
 

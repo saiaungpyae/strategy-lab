@@ -13,20 +13,45 @@ no live trading.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .          # installs deps and the `sl-*` commands below
 ```
+
+The code lives in the `strategylab` package under `src/`. The editable install
+(`pip install -e .`) puts the `sl-*` console commands on your `PATH`; each command
+is also runnable as `python -m strategylab.<module>` if you prefer.
+
+```
+src/strategylab/
+├── core.py                 shared indicators + the mass config sweep
+├── data/fetch.py           OHLCV downloader              →  sl-fetch
+├── strategies/
+│   ├── community.py        backtesting.py strategy library
+│   └── scalp.py            zero-fee maker scalp engine   →  sl-scalp
+├── backtest/
+│   ├── run.py              community-strategy runner     →  sl-backtest
+│   ├── maker.py            taker-vs-maker comparison     →  sl-maker
+│   ├── regime.py           regime-aware maker ladder     →  sl-regime
+│   └── scalp_optimize.py   out-of-sample scalp search    →  sl-scalp-opt
+└── reports/
+    ├── ema.py              EMA/SMA-cross tearsheet        →  sl-ema-report
+    ├── combo.py            SMA50+RSI14 combo tearsheet    →  sl-combo-report
+    └── daily_pnl.py        daily dollar-P&L distribution  →  sl-daily-pnl
+```
+
+Run everything from the project root — `data/` and `reports/` are resolved
+relative to the current directory.
 
 ## 1. Get data
 
 ```bash
 # 1 year of BTC/USDT hourly candles from Binance
-python fetch_ohlcv.py --symbol BTC/USDT --timeframe 1h --since 2024-01-01
+sl-fetch --symbol BTC/USDT --timeframe 1h --since 2024-01-01
 
 # Multiple pairs, 15m candles, saved as Parquet
-python fetch_ohlcv.py -s BTC/USDT ETH/USDT SOL/USDT -t 15m --since 2023-06-01 -f parquet
+sl-fetch -s BTC/USDT ETH/USDT SOL/USDT -t 15m --since 2023-06-01 -f parquet
 
 # A different exchange with an explicit window
-python fetch_ohlcv.py --exchange bybit -s BTC/USDT -t 4h --since 2022-01-01 --until 2023-01-01
+sl-fetch --exchange bybit -s BTC/USDT -t 4h --since 2022-01-01 --until 2023-01-01
 ```
 
 Output lands in `data/`, e.g. `data/binance_BTC-USDT_1h.csv`.
@@ -44,33 +69,33 @@ Columns: `timestamp` (epoch ms), `datetime` (UTC), `open`, `high`, `low`, `close
 
 ## 2. Backtest & research
 
-The scripts fall into three groups. All take `--file data/<something>.csv` and default to
+The commands fall into three groups. All take `--file data/<something>.csv` and default to
 the 1h BTC/USDT set.
 
 ### Strategy comparison
 
-| Script | What it does |
-|--------|--------------|
-| `run_backtest.py` | Runs the classic community strategies in `bt_strategies.py` (supertrend, EMA cross, ...) with realistic fees, ranked against Buy & Hold. |
-| `bt_strategies.py` | Library of long-only community strategies for `backtesting.py`. No lookahead — orders fill at the next bar's open. |
-| `maker_backtest.py` | Same strategies run **two ways** — TAKER (guaranteed fill, pays fee) vs MAKER (zero fee, but fills only if price comes to your limit). Exposes the hidden cost of maker-only execution. |
+| Command | Module | What it does |
+|---------|--------|--------------|
+| `sl-backtest` | `strategylab.backtest.run` | Runs the classic community strategies (supertrend, EMA cross, ...) with realistic fees, ranked against Buy & Hold. |
+| — | `strategylab.strategies.community` | Library of long-only community strategies for `backtesting.py`. No lookahead — orders fill at the next bar's open. |
+| `sl-maker` | `strategylab.backtest.maker` | Same strategies run **two ways** — TAKER (guaranteed fill, pays fee) vs MAKER (zero fee, but fills only if price comes to your limit). Exposes the hidden cost of maker-only execution. |
 
 ### Overfit-resistant search
 
-| Script | What it does |
-|--------|--------------|
-| `strategy_lab.py` | Mass sweep of thousands of configs with a fast vectorized engine and a **train/test split** — the point is to separate real edge from multiple-testing luck. |
-| `scalp_lab.py` | Frequent low-timeframe scalps for a zero-fee maker, modeling adverse-selection cost as a tunable per-fill "edge cost" in bps. |
-| `scalp_optimize.py` | Grid search for a scalp with **out-of-sample surviving** edge at a realistic per-fill cost — no rigged reward:risk, no peeking at the test set. |
-| `regime_lab.py` | Regime-aware, risk-managed maker strategy built as a cumulative ladder (trend filter → regime filter → vol targeting → circuit breaker) tested against a 0.03%/day target. |
+| Command | Module | What it does |
+|---------|--------|--------------|
+| `sl-sweep` | `strategylab.core` | Mass sweep of thousands of configs with a fast vectorized engine and a **train/test split** — the point is to separate real edge from multiple-testing luck. |
+| `sl-scalp` | `strategylab.strategies.scalp` | Frequent low-timeframe scalps for a zero-fee maker, modeling adverse-selection cost as a tunable per-fill "edge cost" in bps. |
+| `sl-scalp-opt` | `strategylab.backtest.scalp_optimize` | Grid search for a scalp with **out-of-sample surviving** edge at a realistic per-fill cost — no rigged reward:risk, no peeking at the test set. |
+| `sl-regime` | `strategylab.backtest.regime` | Regime-aware, risk-managed maker strategy built as a cumulative ladder (trend filter → regime filter → vol targeting → circuit breaker) tested against a 0.03%/day target. |
 
 ### Reports & P&L
 
-| Script | What it does |
-|--------|--------------|
-| `ema_report.py` | Detailed anti-overfit tearsheet for the fixed EMA 12/26 cross (per-year, train/test, neighbour sweep), maker and taker. Writes HTML + Markdown to `reports/`. |
-| `combo_report.py` | Same protocol for the trend-filtered dip-buy combo (`SMA50` + `RSI14<45`) that survived the `strategy_lab` sweep. |
-| `daily_pnl.py` | Turns a scalp equity curve into a **daily dollar P&L distribution** on a fixed capital base — "can I make $X/day?". |
+| Command | Module | What it does |
+|---------|--------|--------------|
+| `sl-ema-report` | `strategylab.reports.ema` | Detailed anti-overfit tearsheet for the fixed EMA 12/26 cross (per-year, train/test, neighbour sweep), maker and taker. Writes HTML + Markdown to `reports/`. |
+| `sl-combo-report` | `strategylab.reports.combo` | Same protocol for the trend-filtered dip-buy combo (`SMA50` + `RSI14<45`) that survived the `sl-sweep` search. |
+| `sl-daily-pnl` | `strategylab.reports.daily_pnl` | Turns a scalp equity curve into a **daily dollar P&L distribution** on a fixed capital base — "can I make $X/day?". |
 
 Generated reports land in `reports/` as paired `.html` / `.md` files.
 
@@ -97,5 +122,7 @@ TradingView lightweight-charts (no account, no external calls):
 
 ## Requirements
 
-`ccxt`, `pandas`, `pyarrow` (Parquet only). See `requirements.txt`. The backtesting
-scripts additionally use `backtesting.py` / vectorized engines as noted in each file.
+`ccxt`, `pandas`, `pyarrow` (Parquet only) — declared in `pyproject.toml` and
+installed by `pip install -e .` (also mirrored in `requirements.txt`). The
+`sl-backtest` / community-strategy modules additionally need `backtesting.py`
+(`pip install backtesting`); the vectorized engines don't.

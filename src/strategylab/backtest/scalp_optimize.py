@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators, PPY
-from scalp_lab import run_scalp, metrics, BARS_PER_DAY
+from strategylab.core import Indicators, PPY
+from strategylab.strategies.scalp import run_scalp, metrics, BARS_PER_DAY
 
 
 def entry_families(ind: Indicators):

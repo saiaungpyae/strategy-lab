@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators, PPY
+from strategylab.core import Indicators, PPY
 
 
 # ----------------------------------------------------------------------------
@@ -159,7 +159,7 @@ def build_strategies(ind: Indicators, offset: float):
     )
 
     # Supertrend — trend flip.
-    from strategy_lab import supertrend_dir
+    from strategylab.core import supertrend_dir
     d = supertrend_dir(ind, 10, 3.0) > 0
     S["supertrend"] = dict(
         entry=d & ~shift_bool(d), exit=(~d) & shift_bool(d),

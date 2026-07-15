@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators
-from scalp_lab import build_scalps, run_scalp
+from strategylab.core import Indicators
+from strategylab.strategies.scalp import build_scalps, run_scalp
 
 
 def main():

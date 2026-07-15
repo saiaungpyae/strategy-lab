@@ -25,8 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy_lab import Indicators, PPY
-from ema_report import (run_maker, run_taker, portfolio_stats, trade_stats,
+from strategylab.core import Indicators, PPY
+from strategylab.reports.ema import (run_maker, run_taker, portfolio_stats, trade_stats,
                         bh, fmt_pct, TAKER_FEE, MAKER_FEE, OFFSET, MAX_WAIT)
 
 
