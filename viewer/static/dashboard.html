@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>strategy-lab · dashboard</title>
+<script src="/lightweight-charts.js"></script>
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b22; --border: #2a2f38;
+    --text: #e6edf3; --muted: #8b949e; --accent: #26a69a;
+    --up: #26a69a; --down: #ef5350; --warn: #f0b429;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: inherit; }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  button, select {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: #3d444d; }
+  .spacer { flex: 1; }
+  #refreshStatus { color: var(--muted); font-size: 12px; }
+  #refreshStatus.busy { color: var(--warn); }
+  main { padding: 16px; max-width: 1500px; margin: 0 auto; }
+  h2 {
+    font-size: 13px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em; margin: 22px 0 10px;
+  }
+  h2:first-child { margin-top: 0; }
+
+  /* --- data health cards --- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; display: block; text-decoration: none;
+  }
+  .card:hover { border-color: #3d444d; }
+  .card .top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .card .name { font-weight: 600; font-size: 14px; }
+  .badge {
+    margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600;
+  }
+  .badge.fresh { background: rgba(38,166,154,0.15); color: var(--up); }
+  .badge.stale { background: rgba(240,180,41,0.15); color: var(--warn); }
+  .badge.old   { background: rgba(239,83,80,0.15);  color: var(--down); }
+  .kv { display: grid; grid-template-columns: auto auto; gap: 2px 14px; font-size: 12px; }
+  .kv span { color: var(--muted); }
+  .kv b { font-weight: 500; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* --- multi-timeframe grid --- */
+  .tfgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+  .pane {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  }
+  .pane .bar {
+    display: flex; align-items: center; padding: 7px 12px; font-size: 12.5px;
+    border-bottom: 1px solid var(--border);
+  }
+  .pane .bar a { color: var(--muted); text-decoration: none; margin-left: auto; font-size: 11.5px; }
+  .pane .bar a:hover { color: var(--text); }
+  .pane .bar b { font-weight: 600; }
+  .minichart { height: 220px; }
+
+  /* --- signal snapshot --- */
+  table { border-collapse: collapse; width: 100%; background: var(--panel);
+          border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { padding: 8px 12px; text-align: left; font-size: 12.5px; }
+  th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border);
+       font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr + tr td { border-top: 1px solid #1c2027; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .sig { font-weight: 600; }
+  .sig.long { color: var(--up); } .sig.flat { color: var(--muted); }
+  .sig small { color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .pos { color: var(--up); } .neg { color: var(--down); }
+
+  /* --- reports --- */
+  .reports { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px; }
+  .report {
+    display: flex; align-items: center; gap: 10px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
+    text-decoration: none; font-size: 13px;
+  }
+  .report:hover { border-color: #3d444d; }
+  .kind {
+    font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+    background: #21262d; color: var(--muted); text-transform: uppercase;
+  }
+  .report .meta { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .empty { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 strategy-lab</h1>
+  <label style="color:var(--muted);font-size:12px">symbol</label>
+  <select id="symbol"></select>
+  <a href="/chart" style="font-size:12.5px;color:var(--muted)">open chart view →</a>
+  <a href="/swarm" style="font-size:12.5px;color:var(--muted)">bot swarm →</a>
+  <span class="spacer"></span>
+  <span id="refreshStatus"></span>
+  <button id="refresh">⟳ refresh data</button>
+</header>
+<main>
+  <h2>Data health</h2>
+  <div class="cards" id="cards"><span class="empty">loading…</span></div>
+
+  <h2>Multi-timeframe · <span id="gridSymbol"></span></h2>
+  <div class="tfgrid" id="tfgrid"></div>
+
+  <h2>Signal snapshot</h2>
+  <div id="snapshot"><span class="empty">loading…</span></div>
+
+  <h2>Reports</h2>
+  <div class="reports" id="reports"><span class="empty">loading…</span></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+function fmtAge(s) {
+  if (s < 90) return 'up to date';
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d) return `${d}d ${h}h behind`;
+  if (h) return `${h}h ${m}m behind`;
+  return `${m}m behind`;
+}
+const fmtDate = t => new Date(t * 1000).toISOString().slice(0, 10);
+const fmtSize = b => b > 1e6 ? (b / 1e6).toFixed(1) + ' MB' : (b / 1e3).toFixed(0) + ' kB';
+
+// ---------------------------------------------------------------- health ---
+let datasets = [];
+
+async function loadHealth() {
+  const d = await (await fetch('/api/health')).json();
+  datasets = d.datasets;
+  $('cards').innerHTML = datasets.length ? '' : '<span class="empty">no datasets in data/</span>';
+  for (const ds of datasets) {
+    const cls = ds.bars_behind <= 1 ? 'fresh' : ds.bars_behind <= 50 ? 'stale' : 'old';
+    const badge = ds.bars_behind <= 1 ? 'fresh' : `${fmt(ds.bars_behind)} bars`;
+    const a = document.createElement('a');
+    a.className = 'card'; a.href = `/chart?file=${encodeURIComponent(ds.file)}`;
+    a.innerHTML = `
+      <div class="top"><span class="name">${ds.symbol} · ${ds.timeframe}</span>
+        <span style="color:var(--muted);font-size:11.5px">${ds.exchange}</span>
+        <span class="badge ${cls}">${badge}</span></div>
+      <div class="kv">
+        <span>candles</span><b>${fmt(ds.rows)}</b>
+        <span>span</span><b>${fmtDate(ds.first)} → ${fmtDate(ds.last)}</b>
+        <span>freshness</span><b>${fmtAge(ds.age_seconds)}</b>
+        <span>gaps · size</span><b>${ds.gaps} · ${fmtSize(ds.size_bytes)}</b>
+      </div>`;
+    $('cards').appendChild(a);
+  }
+  updateSymbols();
+  showRefresh(d.refresh);
+}
+
+// ------------------------------------------------------------- refresh ----
+let pollTimer = null;
+
+function showRefresh(r) {
+  const el = $('refreshStatus');
+  if (r.state === 'running') {
+    el.textContent = 'refreshing datasets…';
+    el.className = 'busy';
+    if (!pollTimer) pollTimer = setInterval(pollRefresh, 2000);
+  } else {
+    el.className = '';
+    if (r.state === 'done') {
+      const added = (r.results || []).reduce((a, x) => a + (x.added || 0), 0);
+      const errs = (r.results || []).filter(x => x.error).length;
+      el.textContent = `refreshed: +${fmt(added)} candles` + (errs ? ` · ${errs} error(s)` : '');
+    } else el.textContent = '';
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; reloadAll(); }
+  }
+}
+
+async function pollRefresh() {
+  showRefresh(await (await fetch('/api/refresh')).json());
+}
+
+$('refresh').onclick = async () => {
+  const r = await (await fetch('/api/refresh', { method: 'POST' })).json();
+  showRefresh(r);
+};
+
+// ------------------------------------------------------ multi-TF grid -----
+const tfSec = tf => { const m = tf.match(/^(\d+)([smhdwM])$/); return m ? m[1] * { s: 1, m: 60, h: 3600, d: 86400, w: 604800, M: 2592000 }[m[2]] : 0; };
+let charts = [];
+
+function updateSymbols() {
+  const symbols = [...new Set(datasets.map(d => d.symbol))];
+  const sel = $('symbol'), had = sel.value;
+  sel.innerHTML = '';
+  for (const s of symbols) {
+    const o = document.createElement('option'); o.value = o.textContent = s; sel.appendChild(o);
+  }
+  if (symbols.includes(had)) sel.value = had;
+  drawGrid();
+}
+$('symbol').onchange = drawGrid;
+
+async function drawGrid() {
+  const symbol = $('symbol').value;
+  $('gridSymbol').textContent = symbol || '';
+  for (const c of charts) c.remove();
+  charts = [];
+  const grid = $('tfgrid');
+  grid.innerHTML = '';
+  const files = datasets.filter(d => d.symbol === symbol)
+                        .sort((a, b) => tfSec(a.timeframe) - tfSec(b.timeframe));
+  for (const ds of files) {
+    const pane = document.createElement('div');
+    pane.className = 'pane';
+    pane.innerHTML = `<div class="bar"><b>${ds.timeframe}</b>&nbsp;<span style="color:var(--muted)">· ${ds.exchange}</span>
+      <a href="/chart?file=${encodeURIComponent(ds.file)}">open →</a></div>
+      <div class="minichart"></div>`;
+    grid.appendChild(pane);
+    const el = pane.querySelector('.minichart');
+    const chart = LightweightCharts.createChart(el, {
+      layout: { background: { color: 'transparent' }, textColor: '#8b949e', fontSize: 11 },
+      grid: { vertLines: { color: '#1c2027' }, horzLines: { color: '#1c2027' } },
+      rightPriceScale: { borderColor: '#2a2f38' },
+      timeScale: { borderColor: '#2a2f38', timeVisible: true, secondsVisible: false },
+      crosshair: { mode: 1 }, autoSize: true,
+      handleScroll: false, handleScale: false,
+    });
+    charts.push(chart);
+    const series = chart.addCandlestickSeries({
+      upColor: '#26a69a', downColor: '#ef5350',
+      borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+    });
+    fetch(`/api/candles?file=${encodeURIComponent(ds.file)}&bars=200`)
+      .then(r => r.json())
+      .then(d => { if (!d.error) { series.setData(d.candles); chart.timeScale().fitContent(); } });
+  }
+}
+
+// ------------------------------------------------------------ snapshot ----
+const SIGS = [['ema_cross', 'EMA 12/26'], ['sma_cross', 'SMA 50/200'], ['supertrend', 'Supertrend']];
+
+async function loadSnapshot() {
+  const d = await (await fetch('/api/snapshot')).json();
+  if (!d.datasets.length) { $('snapshot').innerHTML = '<span class="empty">no datasets</span>'; return; }
+  let html = `<table><tr><th>dataset</th><th>last close</th><th>24h</th>`
+    + SIGS.map(([, label]) => `<th>${label}</th>`).join('') + `<th>open FVGs</th></tr>`;
+  for (const ds of d.datasets) {
+    if (ds.error) { html += `<tr><td>${ds.label}</td><td colspan="6" style="color:var(--down)">${ds.error}</td></tr>`; continue; }
+    const ch = ds.change_24h_pct;
+    html += `<tr><td><a href="/chart?file=${encodeURIComponent(ds.file)}" style="text-decoration:none">${ds.symbol} · ${ds.timeframe}</a></td>`
+      + `<td class="num">${fmt(ds.last_close)}</td>`
+      + `<td class="num ${ch >= 0 ? 'pos' : 'neg'}">${ch == null ? '–' : (ch >= 0 ? '+' : '') + ch.toFixed(2) + '%'}</td>`;
+    for (const [key] of SIGS) {
+      const s = ds.signals[key];
+      html += `<td><span class="sig ${s.state}">${s.state}</span><small>${fmt(s.bars_since_flip)} bars ago</small></td>`;
+    }
+    html += `<td class="num">${ds.signals.fvg_open}</td></tr>`;
+  }
+  $('snapshot').innerHTML = html + '</table>';
+}
+
+// ------------------------------------------------------------- reports ----
+async function loadReports() {
+  const d = await (await fetch('/api/reports')).json();
+  $('reports').innerHTML = d.reports.length ? '' : '<span class="empty">nothing in reports/ yet</span>';
+  for (const r of d.reports) {
+    const a = document.createElement('a');
+    a.className = 'report'; a.href = `/reports/${encodeURIComponent(r.file)}`; a.target = '_blank';
+    a.innerHTML = `<span class="kind">${r.kind}</span>${r.file}
+      <span class="meta">${fmtSize(r.size_bytes)} · ${fmtDate(r.mtime)}</span>`;
+    $('reports').appendChild(a);
+  }
+}
+
+function reloadAll() { loadHealth(); loadSnapshot(); }
+
+loadHealth();
+loadSnapshot();
+loadReports();
+</script>
+</body>
+</html>

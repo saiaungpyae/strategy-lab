@@ -19,9 +19,12 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import sys
+import threading
+import time
 from functools import lru_cache
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -34,6 +37,22 @@ from zoneinfo import ZoneInfo
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE.parent / "data"
 STATIC_DIR = HERE / "static"
+REPORTS_DIR = HERE.parent / "reports"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ (shell env wins)."""
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+_load_dotenv(HERE.parent / ".env")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -41,6 +60,47 @@ PORT = int(os.environ.get("PORT", "8000"))
 # samples match what the backtests in strategylab.backtest actually traded.
 from strategylab.core import Indicators, supertrend_dir  # noqa: E402
 from strategylab.backtest.fvg import FVGParams, run_fvg_study  # noqa: E402
+from strategylab.data.fetch import update_all  # noqa: E402
+
+
+# ----------------------------------------------------------------------------
+# Background data refresh — incremental update of every dataset in data/.
+# Runs once on startup and on demand via POST /api/refresh. The server keeps
+# serving whatever is on disk while a refresh is in flight; the mtime-keyed
+# caches below pick up rewritten files automatically.
+# ----------------------------------------------------------------------------
+REFRESH = {"state": "idle", "started": None, "finished": None, "results": []}
+_refresh_lock = threading.Lock()
+
+
+def _refresh_worker() -> None:
+    try:
+        results = update_all(DATA_DIR)
+    except Exception as e:  # never let a refresh failure kill the thread noisily
+        results = [{"file": "*", "error": f"{type(e).__name__}: {e}"}]
+    with _refresh_lock:
+        REFRESH.update(state="done", finished=time.time(), results=results)
+    added = sum(r.get("added", 0) for r in results)
+    errors = [r for r in results if "error" in r]
+    suffix = f", {len(errors)} error(s)" if errors else ""
+    print(f"  refresh done: +{added:,} candles across {len(results)} file(s){suffix}")
+    for r in errors:
+        print(f"    ! {r['file']}: {r['error']}", file=sys.stderr)
+
+
+def start_refresh() -> bool:
+    """Kick off a background refresh; returns False if one is already running."""
+    with _refresh_lock:
+        if REFRESH["state"] == "running":
+            return False
+        REFRESH.update(state="running", started=time.time(), finished=None)
+    threading.Thread(target=_refresh_worker, daemon=True).start()
+    return True
+
+
+def refresh_status() -> dict:
+    with _refresh_lock:
+        return dict(REFRESH)
 
 # Cache raw CSV loads so repeated requests / bar-count changes are instant.
 # Keyed by (path, mtime) so a re-fetched file is picked up automatically.
@@ -267,6 +327,249 @@ def fvg_payload(filename: str, bars: int, rr: float) -> dict:
     return {"file": filename, "zones": zones, "markers": markers, "summary": summary}
 
 
+# ----------------------------------------------------------------------------
+# Dashboard payloads — data health, latest signal states, reports listing.
+# ----------------------------------------------------------------------------
+_TF_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 2592000}
+
+
+def tf_seconds(tf: str) -> int:
+    m = re.match(r"^([0-9]+)([smhdwM])$", tf)
+    return int(m.group(1)) * _TF_UNIT_S[m.group(2)] if m else 0
+
+
+def health_payload() -> dict:
+    now = time.time()
+    items = []
+    for d in list_datasets():
+        path = DATA_DIR / d["file"]
+        df = load_df(path)
+        step = tf_seconds(d["timeframe"])
+        ts = df["time"]
+        gaps = int((ts.diff().dropna() > step).sum()) if step else 0
+        last = int(ts.iloc[-1])
+        age = now - (last + step)  # measured from when the last candle *closed*
+        items.append({
+            **d,
+            "rows": len(df),
+            "first": int(ts.iloc[0]),
+            "last": last,
+            "age_seconds": max(0, int(age)),
+            "bars_behind": int(age // step) if step else None,
+            "gaps": gaps,
+            "size_bytes": path.stat().st_size,
+        })
+    return {"datasets": items, "refresh": refresh_status()}
+
+
+def _regime_state(regime: np.ndarray) -> dict:
+    """Latest direction and how many bars ago it flipped."""
+    n = len(regime)
+    state = bool(regime[-1])
+    flip = 0
+    for i in range(n - 1, 0, -1):
+        if regime[i] != regime[i - 1]:
+            flip = n - i
+            break
+    else:
+        flip = n  # never flipped inside the window
+    return {"state": "long" if state else "flat", "bars_since_flip": flip}
+
+
+@lru_cache(maxsize=16)
+def _snapshot_one(path_str: str, mtime: float) -> dict:
+    # Tail window: enough for SMA200 warmup + a meaningful flip lookback.
+    df = pd.read_csv(path_str).tail(1500).reset_index(drop=True)
+    df["time"] = (df["timestamp"] // 1000).astype("int64")
+    dfi = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                             "close": "Close", "volume": "Volume"})
+    ind = Indicators(dfi)
+    close = df["close"].to_numpy()
+
+    out = {}
+    for key, regime in (
+        ("ema_cross", ind.ema(12) > ind.ema(26)),
+        ("sma_cross", ind.sma(50) > ind.sma(200)),
+        ("supertrend", supertrend_dir(ind, 10, 3.0) > 0),
+    ):
+        out[key] = _regime_state(np.asarray(regime))
+
+    # FVG: count zones formed in the tail window that are still unresolved.
+    events, _ = run_fvg_study(df, FVGParams())
+    out["fvg_open"] = sum(1 for ev in events if ev.outcome == "open")
+
+    return {
+        "last_close": float(close[-1]),
+        "last_time": int(df["time"].iloc[-1]),
+        "signals": out,
+    }
+
+
+def snapshot_payload() -> dict:
+    items = []
+    for d in list_datasets():
+        path = DATA_DIR / d["file"]
+        try:
+            snap = _snapshot_one(str(path), path.stat().st_mtime)
+        except Exception as e:
+            items.append({**d, "error": f"{type(e).__name__}: {e}"})
+            continue
+        # 24h % change from the candle ~24h before the last one
+        step = tf_seconds(d["timeframe"])
+        df = load_df(path)
+        back = int(86400 // step) if step else 0
+        change = None
+        if back and len(df) > back:
+            prev = float(df["close"].iloc[-1 - back])
+            change = (snap["last_close"] - prev) / prev * 100
+        items.append({**d, **snap, "change_24h_pct": change})
+    return {"datasets": items}
+
+
+def reports_payload() -> dict:
+    items = []
+    if REPORTS_DIR.is_dir():
+        for p in sorted(REPORTS_DIR.iterdir()):
+            if p.name.startswith(".") or not p.is_file():
+                continue
+            items.append({
+                "file": p.name,
+                "kind": p.suffix.lstrip("."),
+                "size_bytes": p.stat().st_size,
+                "mtime": int(p.stat().st_mtime),
+            })
+    return {"reports": items}
+
+
+def safe_report_path(filename: str) -> Path | None:
+    if not filename:
+        return None
+    candidate = (REPORTS_DIR / filename).resolve()
+    if candidate.parent != REPORTS_DIR.resolve() or not candidate.is_file():
+        return None
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Bot swarm (strategylab.swarm) — the server only reads run artifacts from
+# reports/swarm/<run_id>/ and can spawn `sl-swarm run` as a separate process.
+# It never simulates anything in-request.
+
+SWARM_DIR = REPORTS_DIR / "swarm"
+_swarm_proc = None
+_swarm_lock = threading.Lock()
+
+
+def safe_swarm_dir(run_id: str) -> Path | None:
+    if not run_id or not re.fullmatch(r"[A-Za-z0-9_\-]+", run_id):
+        return None
+    d = (SWARM_DIR / run_id).resolve()
+    if d.parent != SWARM_DIR.resolve() or not d.is_dir():
+        return None
+    return d
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def swarm_runs_payload() -> dict:
+    runs = []
+    if SWARM_DIR.is_dir():
+        for d in sorted(SWARM_DIR.iterdir(), reverse=True):
+            if not d.is_dir() or not (d / "config.json").is_file():
+                continue  # skip evolution artifact dirs etc.
+            cfg = _read_json(d / "config.json") or {}
+            prog = _read_json(d / "progress.json") or {}
+            runs.append({
+                "run_id": d.name,
+                "bots": cfg.get("bots"),
+                "span": cfg.get("span"),
+                "split_date": cfg.get("split_date"),
+                "created": cfg.get("created"),
+                "stage": prog.get("stage"),
+                "frac": prog.get("frac"),
+                "has_recap": (d / "recap.json").is_file(),
+            })
+    running = _swarm_proc is not None and _swarm_proc.poll() is None
+    return {"runs": runs, "running": running}
+
+
+@lru_cache(maxsize=4)
+def _swarm_tables(run_dir: str, mtime: float):
+    import numpy as _np
+    import pandas as _pd
+    d = Path(run_dir)
+    z = _np.load(d / "daily_equity.npz", allow_pickle=False)
+    return (_pd.read_csv(d / "genomes.csv"), _pd.read_csv(d / "results.csv"),
+            z["daily"], [str(x) for x in z["days"]], int(z["split_day"]))
+
+
+def swarm_bot_payload(run_id: str, bot_id: int) -> dict:
+    d = safe_swarm_dir(run_id)
+    if d is None:
+        return {"error": "run not found"}
+    gdf, res, daily, days, split_day = _swarm_tables(
+        str(d), (d / "results.csv").stat().st_mtime)
+    if not (0 <= bot_id < len(gdf)):
+        return {"error": "bot not found"}
+    row = daily[bot_id].astype(float)
+    step = max(1, len(days) // 400)
+    sel = list(range(0, len(days), step))
+    if sel[-1] != len(days) - 1:
+        sel.append(len(days) - 1)
+
+    def _clean(rec):
+        return {k: (None if (isinstance(v, float) and v != v) else
+                    (v.item() if hasattr(v, "item") else v))
+                for k, v in rec.items()}
+
+    return {
+        "genome": _clean(gdf.iloc[bot_id].to_dict()),
+        "result": _clean(res.iloc[bot_id].to_dict()),
+        "days": [days[i] for i in sel],
+        "equity": [round(row[i], 2) for i in sel],
+        "split_day": days[split_day],
+    }
+
+
+def start_swarm(params: dict) -> dict:
+    global _swarm_proc
+    import subprocess
+    with _swarm_lock:
+        if _swarm_proc is not None and _swarm_proc.poll() is None:
+            return {"started": False, "error": "a swarm is already running"}
+        try:
+            bots = max(100, min(int(params.get("bots", 2000)), 20000))
+            split = min(max(float(params.get("split", 0.7)), 0.5), 0.9)
+            seed = int(params.get("seed", 42))
+            ctrl = min(max(float(params.get("control_frac", 0.1)), 0.0), 0.5)
+        except (TypeError, ValueError):
+            return {"started": False, "error": "bad parameters"}
+        since = str(params.get("since") or "")
+        if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+            return {"started": False, "error": "bad since date"}
+        cmd = [sys.executable, "-m", "strategylab.swarm.run", "run",
+               "--bots", str(bots), "--split", str(split), "--seed", str(seed),
+               "--control-frac", str(ctrl)]
+        if since:
+            cmd += ["--since", since]
+        metrics = str(params.get("metrics") or "")
+        if metrics:
+            p = Path(metrics)
+            if not (p.is_file() and p.resolve().is_relative_to(HERE.parent.resolve())):
+                return {"started": False, "error": "metrics file not found"}
+            cmd += ["--metrics", str(p)]
+        SWARM_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(SWARM_DIR / "last_start.log", "w")
+        _swarm_proc = subprocess.Popen(cmd, cwd=str(HERE.parent),
+                                       stdout=log, stderr=subprocess.STDOUT)
+        return {"started": True, "cmd": " ".join(cmd)}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
@@ -283,12 +586,69 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
 
-        if route == "/" or route == "/index.html":
+        if route == "/" or route == "/dashboard.html":
+            self.path = "/dashboard.html"
+            return super().do_GET()
+
+        if route == "/chart" or route == "/index.html":
             self.path = "/index.html"
             return super().do_GET()
 
+        if route == "/swarm" or route == "/swarm.html":
+            self.path = "/swarm.html"
+            return super().do_GET()
+
+        if route == "/api/swarm/runs":
+            return self._send_json(swarm_runs_payload())
+
+        if route == "/api/swarm/run":
+            q = parse_qs(parsed.query)
+            d = safe_swarm_dir((q.get("id") or [""])[0])
+            if d is None:
+                return self._send_json({"error": "run not found"}, 404)
+            recap = _read_json(d / "recap.json")
+            if recap is None:
+                return self._send_json(
+                    {"error": "recap not ready",
+                     "progress": _read_json(d / "progress.json")}, 202)
+            return self._send_json(recap)
+
+        if route == "/api/swarm/bot":
+            q = parse_qs(parsed.query)
+            try:
+                bot = int((q.get("bot") or ["-1"])[0])
+            except ValueError:
+                bot = -1
+            payload = swarm_bot_payload((q.get("id") or [""])[0], bot)
+            return self._send_json(payload, 404 if "error" in payload else 200)
+
         if route == "/api/files":
             return self._send_json(list_datasets())
+
+        if route == "/api/health":
+            return self._send_json(health_payload())
+
+        if route == "/api/snapshot":
+            return self._send_json(snapshot_payload())
+
+        if route == "/api/reports":
+            return self._send_json(reports_payload())
+
+        if route == "/api/refresh":
+            return self._send_json(refresh_status())
+
+        if route.startswith("/reports/"):
+            path = safe_report_path(route[len("/reports/"):])
+            if path is None:
+                return self._send_json({"error": "report not found"}, 404)
+            body = path.read_bytes()
+            ctype = mimetypes.guess_type(path.name)[0] or "text/plain"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if route == "/api/candles":
             q = parse_qs(parsed.query)
@@ -332,6 +692,30 @@ class Handler(SimpleHTTPRequestHandler):
         # anything else -> static file from viewer/static
         return super().do_GET()
 
+    def do_POST(self):
+        route = urlparse(self.path).path
+        if route == "/api/refresh":
+            triggered = start_refresh()  # False -> one was already running
+            return self._send_json({"triggered": triggered, **refresh_status()})
+        if route == "/api/swarm/start":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                params = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                return self._send_json({"started": False, "error": "bad body"}, 400)
+            result = start_swarm(params)
+            return self._send_json(result, 200 if result.get("started") else 409)
+        return self._send_json({"error": "not found"}, 404)
+
+    def handle_one_request(self):
+        # A browser closing a tab or aborting a poll mid-response shows up as a
+        # broken pipe / reset while we're writing the body. That's expected for
+        # a polling dashboard, not a server error, so swallow it quietly.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
     def log_message(self, fmt, *args):  # quieter console
         return
 
@@ -340,6 +724,9 @@ def main():
     if not DATA_DIR.exists():
         print(f"! No data directory at {DATA_DIR}. Fetch some candles first.")
     print(f"Datasets found: {[d['file'] for d in list_datasets()] or 'none'}")
+    if list_datasets():
+        print("  refreshing datasets in the background...")
+        start_refresh()
     print(f"\n  Candle viewer running at  http://{HOST}:{PORT}\n  (Ctrl+C to stop)\n")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 

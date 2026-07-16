@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 sl-fetch       = "strategylab.data.fetch:main"
+sl-update      = "strategylab.data.fetch:main_update"
 sl-sweep       = "strategylab.core:main"
 sl-backtest    = "strategylab.backtest.run:main"
 sl-maker       = "strategylab.backtest.maker:main"
@@ -25,6 +26,7 @@ sl-scalp-opt   = "strategylab.backtest.scalp_optimize:main"
 sl-ema-report  = "strategylab.reports.ema:main"
 sl-combo-report = "strategylab.reports.combo:main"
 sl-daily-pnl   = "strategylab.reports.daily_pnl:main"
+sl-swarm       = "strategylab.swarm.run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

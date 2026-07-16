@@ -32,10 +32,16 @@ secrets.json
 htmlcov/
 
 # ---- Generated data & reports (regenerable outputs) ----
-data/*.csv
-reports/*.csv
-reports/*.html
-reports/*.md
+# Market data, metrics, and all swarm/backtest run artifacts are regenerable.
+# Leading slash anchors these to the repo root so src/strategylab/data/ (source) is unaffected.
+/data/
+/reports/
+
+# ---- Design & working docs (not source) ----
+*.pen
+bot-swarm-discussion.md
+strategy-lab-pen-review.md
+strategy-lab-screen-roadmap.md
 
 # ---- OS / editor cruft ----
 .DS_Store

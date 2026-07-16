@@ -7,6 +7,10 @@ Coinbase, Kraken, ...) using only free public endpoints — no API key, no
 scraping, no TradingView. Handles pagination and rate limits automatically so
 you can grab years of history in one command, then backtest fully offline.
 
+On Binance-family exchanges the saved files also carry two extra kline
+columns — `taker_buy_volume` (taker buy base volume) and `n_trades` — which
+unlock the order-flow features in the swarm feature pool.
+
 Examples
 --------
   # 1 year of BTC/USDT hourly candles from Binance -> data/binance_BTC-USDT_1h.csv
@@ -25,6 +29,7 @@ List the timeframes an exchange supports:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -43,6 +48,41 @@ except ImportError:
 # One candle request is capped by each exchange (often 500-1500 rows). We ask
 # for a big page and let ccxt clamp it to the exchange maximum.
 PAGE_LIMIT = 1000
+
+# Binance's raw kline endpoints return fields that ccxt's parsed OHLCV drops:
+# number of trades (index 8) and taker buy base volume (index 9). Exchanges
+# with such an endpoint get these saved as extra columns; others fall back to
+# plain OHLCV.
+RAW_KLINE_METHODS = {
+    "binance": "public_get_klines",
+    "binanceus": "public_get_klines",
+    "binanceusdm": "fapipublic_get_klines",
+    "binancecoinm": "dapipublic_get_klines",
+}
+EXTRA_COLS = ["taker_buy_volume", "n_trades"]
+
+
+def _raw_kline_fetcher(exchange: "ccxt.Exchange", symbol: str, timeframe: str):
+    """Return a callable(since_ms, limit) yielding OHLCV rows with taker buy
+    volume and trade count appended, or None if the exchange has no raw
+    Binance-style kline endpoint."""
+    method = getattr(exchange, RAW_KLINE_METHODS.get(exchange.id, ""), None)
+    if method is None:
+        return None
+    exchange.load_markets()  # cached after the first call
+    market_id = exchange.market(symbol)["id"]
+    interval = exchange.timeframes.get(timeframe, timeframe)
+
+    def fetch(since_ms: int, limit: int) -> list[list]:
+        raw = method({"symbol": market_id, "interval": interval,
+                      "startTime": since_ms, "limit": limit})
+        # kline: [openTime, open, high, low, close, volume, closeTime,
+        #         quoteVolume, nTrades, takerBuyBase, takerBuyQuote, ...]
+        return [[int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+                 float(k[4]), float(k[5]), float(k[9]), int(k[8])]
+                for k in raw]
+
+    return fetch
 
 
 def parse_date_to_ms(date_str: str) -> int:
@@ -76,7 +116,16 @@ def fetch_symbol(
     since_ms: int,
     until_ms: int | None,
 ) -> "pd.DataFrame":
-    """Page through the exchange's OHLCV endpoint until we reach `until` (or now)."""
+    """Page through the exchange's OHLCV endpoint until we reach `until` (or now).
+
+    On Binance-family exchanges the returned frame also carries the extra
+    kline columns `taker_buy_volume` and `n_trades` (see EXTRA_COLS).
+    """
+    raw_fetch = _raw_kline_fetcher(exchange, symbol, timeframe)
+    cols = ["timestamp", "open", "high", "low", "close", "volume"]
+    if raw_fetch is not None:
+        cols += EXTRA_COLS
+
     all_rows: list[list] = []
     cursor = since_ms
     tf_ms = exchange.parse_timeframe(timeframe) * 1000  # seconds -> ms
@@ -84,7 +133,10 @@ def fetch_symbol(
 
     while cursor < end:
         try:
-            batch = exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=PAGE_LIMIT)
+            if raw_fetch is not None:
+                batch = raw_fetch(cursor, PAGE_LIMIT)
+            else:
+                batch = exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=PAGE_LIMIT)
         except ccxt.RateLimitExceeded:
             time.sleep(2)
             continue
@@ -116,14 +168,14 @@ def fetch_symbol(
             break
 
     if not all_rows:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=cols)
 
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_rows, columns=cols)
     df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
     if until_ms is not None:
         df = df[df["timestamp"] < until_ms]
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df[["timestamp", "datetime", "open", "high", "low", "close", "volume"]]
+    return df[["timestamp", "datetime"] + cols[1:]]
 
 
 def save(df: "pd.DataFrame", out_dir: Path, exchange_name: str, symbol: str, timeframe: str, fmt: str) -> Path:
@@ -137,6 +189,119 @@ def save(df: "pd.DataFrame", out_dir: Path, exchange_name: str, symbol: str, tim
         path = out_dir / f"{stem}.csv"
         df.to_csv(path, index=False)
     return path
+
+
+# ----------------------------------------------------------------------------
+# Incremental updates — bring an existing dataset file up to the present by
+# fetching only the candles after the last one on disk. The last saved candle
+# is re-fetched too (it may have been captured mid-bar), and the still-forming
+# current candle is dropped so every stored row is final.
+# ----------------------------------------------------------------------------
+DATASET_RE = re.compile(r"^(?P<exchange>.+?)_(?P<symbol>.+?)_(?P<tf>[0-9]+[smhdwM])\.(?P<ext>csv|parquet)$")
+
+
+def parse_dataset_filename(path: Path) -> dict | None:
+    """binance_BTC-USDT_15m.csv -> {exchange, symbol, timeframe, format}."""
+    m = DATASET_RE.match(path.name)
+    if not m:
+        return None
+    return {
+        "exchange": m["exchange"],
+        "symbol": m["symbol"].replace("-", "/"),
+        "timeframe": m["tf"],
+        "format": m["ext"],
+    }
+
+
+def read_dataset(path: Path) -> "pd.DataFrame":
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def update_file(path: Path, exchange: "ccxt.Exchange | None" = None) -> dict:
+    """Extend `path` with candles from its last saved timestamp through now.
+
+    Returns {"file", "added", "rows", "last"} on success or {"file", "error"}.
+    """
+    info = parse_dataset_filename(path)
+    if info is None:
+        return {"file": path.name, "error": "unrecognized filename pattern"}
+
+    try:
+        old = read_dataset(path)
+        if old.empty:
+            return {"file": path.name, "error": "existing file is empty"}
+        last_ts = int(old["timestamp"].iloc[-1])
+
+        if exchange is None:
+            exchange = make_exchange(info["exchange"])
+        tf_ms = exchange.parse_timeframe(info["timeframe"]) * 1000
+
+        # Re-fetch from the last saved candle so a partial capture gets finalized.
+        new = fetch_symbol(exchange, info["symbol"], info["timeframe"], last_ts, None)
+        # Drop the still-forming current candle: keep only fully closed bars.
+        now_ms = exchange.milliseconds()
+        new = new[new["timestamp"] + tf_ms <= now_ms]
+
+        if new.empty:
+            return {"file": path.name, "added": 0, "rows": len(old),
+                    "last": str(old["datetime"].iloc[-1])}
+
+        # Preserve the on-disk schema: files written before the extra kline
+        # columns (EXTRA_COLS) existed stay plain OHLCV — a mostly-NaN
+        # order-flow column would silently enable order-flow features
+        # downstream. A full re-fetch upgrades them.
+        new = new.drop(columns=[c for c in EXTRA_COLS if c not in old.columns],
+                       errors="ignore")
+
+        merged = pd.concat([old, new], ignore_index=True)
+        # keep="last" so the re-fetched (final) version of the last candle wins
+        merged = merged.drop_duplicates(subset="timestamp", keep="last")
+        merged = merged.sort_values("timestamp").reset_index(drop=True)
+
+        if info["format"] == "parquet":
+            merged.to_parquet(path, index=False)
+        else:
+            merged.to_csv(path, index=False)
+        return {"file": path.name, "added": len(merged) - len(old), "rows": len(merged),
+                "last": str(merged["datetime"].iloc[-1])}
+    except Exception as e:  # network down, exchange error, bad file — report, don't raise
+        return {"file": path.name, "error": f"{type(e).__name__}: {e}"}
+
+
+def update_all(data_dir: Path) -> list[dict]:
+    """Incrementally update every recognized dataset file in `data_dir`."""
+    paths = sorted(p for p in data_dir.glob("*") if parse_dataset_filename(p))
+    exchanges: dict[str, "ccxt.Exchange"] = {}  # one instance per exchange id
+    results = []
+    for p in paths:
+        name = parse_dataset_filename(p)["exchange"]
+        try:
+            ex = exchanges.get(name) or exchanges.setdefault(name, make_exchange(name))
+        except SystemExit:  # make_exchange sys.exits on unknown ids
+            results.append({"file": p.name, "error": f"unknown exchange '{name}'"})
+            continue
+        results.append(update_file(p, ex))
+    return results
+
+
+def main_update() -> None:
+    p = argparse.ArgumentParser(
+        description="Incrementally update existing dataset files (fetch only missing candles).",
+    )
+    p.add_argument("--data", "-d", default="data", help="Data directory (default: data/)")
+    args = p.parse_args()
+
+    data_dir = Path(args.data)
+    if not data_dir.is_dir():
+        sys.exit(f"No data directory at {data_dir}")
+
+    for r in update_all(data_dir):
+        if "error" in r:
+            print(f"  ! {r['file']}: {r['error']}", file=sys.stderr)
+        else:
+            print(f"  ✓ {r['file']}: +{r['added']:,} candles ({r['rows']:,} total, through {r['last']})")
 
 
 def main() -> None:

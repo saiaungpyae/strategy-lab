@@ -23,7 +23,7 @@ is also runnable as `python -m strategylab.<module>` if you prefer.
 ```
 src/strategylab/
 ├── core.py                 shared indicators + the mass config sweep
-├── data/fetch.py           OHLCV downloader              →  sl-fetch
+├── data/fetch.py           OHLCV downloader + updater    →  sl-fetch, sl-update
 ├── strategies/
 │   ├── community.py        backtesting.py strategy library
 │   └── scalp.py            zero-fee maker scalp engine   →  sl-scalp
@@ -32,6 +32,11 @@ src/strategylab/
 │   ├── maker.py            taker-vs-maker comparison     →  sl-maker
 │   ├── regime.py           regime-aware maker ladder     →  sl-regime
 │   └── scalp_optimize.py   out-of-sample scalp search    →  sl-scalp-opt
+├── swarm/                  bot-swarm pattern search      →  sl-swarm
+│   ├── genome.py           trait + perception sampling (reproducible per seed)
+│   ├── features.py         feature pool + Binance Vision metrics downloader
+│   ├── engine.py           vectorized sim: maker fills, ruin line, sizing
+│   └── recap.py            yardstick / trait / persistence statistics
 └── reports/
     ├── ema.py              EMA/SMA-cross tearsheet        →  sl-ema-report
     ├── combo.py            SMA50+RSI14 combo tearsheet    →  sl-combo-report
@@ -67,6 +72,21 @@ Columns: `timestamp` (epoch ms), `datetime` (UTC), `open`, `high`, `low`, `close
 | `--format`, `-f` | `csv` | `csv` or `parquet` |
 | `--out`, `-o` | `data` | Output directory |
 
+### Keeping data current
+
+`sl-update` brings every dataset in `data/` up to the present **incrementally** —
+it reads the last saved candle per file and fetches only the missing span
+(re-finalizing the last candle and skipping the still-forming one):
+
+```bash
+sl-update            # update everything in data/
+sl-update -d other/  # a different data directory
+```
+
+The chart viewer also runs the same update automatically in the background on
+startup, and on demand via the dashboard's *refresh data* button
+(`POST /api/refresh`).
+
 ## 2. Backtest & research
 
 The commands fall into three groups. All take `--file data/<something>.csv` and default to
@@ -88,6 +108,7 @@ the 1h BTC/USDT set.
 | `sl-scalp` | `strategylab.strategies.scalp` | Frequent low-timeframe scalps for a zero-fee maker, modeling adverse-selection cost as a tunable per-fill "edge cost" in bps. |
 | `sl-scalp-opt` | `strategylab.backtest.scalp_optimize` | Grid search for a scalp with **out-of-sample surviving** edge at a realistic per-fill cost — no rigged reward:risk, no peeking at the test set. |
 | `sl-regime` | `strategylab.backtest.regime` | Regime-aware, risk-managed maker strategy built as a cumulative ladder (trend filter → regime filter → vol targeting → circuit breaker) tested against a 0.03%/day target. |
+| `sl-swarm` | `strategylab.swarm.run` | **Bot swarm**: thousands of sampled bots (perception rules over market features + behavioral traits) plus a random placebo group, judged strictly out-of-sample. `run` simulates and writes artifacts to `reports/swarm/<run_id>/` (`--maker-only` restricts entries to resting limits — stops still exit as taker; `--metrics` / `--funding` merge derivatives sentiment into the feature pool); `fetch-metrics` downloads open-interest / long-short-ratio history (5m, Sep 2020+) from the Binance Vision archive; `fetch-funding` pulls perp funding-rate history via ccxt; `report` rebuilds a recap. Results dashboard at `/swarm` in the viewer. Design rationale: `bot-swarm-discussion.md`. |
 
 ### Reports & P&L
 
@@ -99,15 +120,25 @@ the 1h BTC/USDT set.
 
 Generated reports land in `reports/` as paired `.html` / `.md` files.
 
-## 3. Chart viewer
+## 3. Dashboard & chart viewer
 
-A tiny offline web viewer for the CSVs in `data/`, using vendored
-TradingView lightweight-charts (no account, no external calls):
+A local web UI for the CSVs in `data/`, using vendored TradingView
+lightweight-charts (no account; the only external calls are the incremental
+data refreshes against the exchange's public API):
 
 ```bash
 ./.venv/bin/python viewer/server.py
-# then open http://127.0.0.1:8000
+# then open http://127.0.0.1:8000   (HOST/PORT configurable via .env)
 ```
+
+- **`/` — dashboard**: per-dataset health cards (freshness, gaps, span),
+  a multi-timeframe chart grid per symbol, latest signal states
+  (EMA/SMA cross, supertrend, open FVGs), and the `reports/` folder as
+  clickable links. Datasets auto-refresh in the background on startup;
+  the *refresh data* button re-runs it anytime.
+- **`/chart` — drill-down**: the full single-chart view with US-session
+  shading, signal overlays, and the FVG event study
+  (deep-linkable as `/chart?file=binance_BTC-USDT_15m.csv`).
 
 ## Design principles
 
