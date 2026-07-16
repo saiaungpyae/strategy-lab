@@ -17,7 +17,9 @@ Protocol (the anti-overfit rules are structural, not optional):
 from __future__ import annotations
 
 import json
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -56,31 +58,71 @@ def _window(mkt, ts, t0, t1, qs):
     return w, i0, i1
 
 
-def _evaluate(pop, w5, w15, cfg, n_days):
+def _eval_cohort(w, pop, idx, cfg, n_days):
+    """Worker: one (population, timeframe) cohort. Identical inputs/seeds to
+    the serial path, so results are bit-for-bit the same regardless of jobs."""
     out = _alloc(pop.n, n_days)
-    engine.run_cohort(w5, pop, np.flatnonzero(pop.tf == 0), cfg, out)
-    engine.run_cohort(w15, pop, np.flatnonzero(pop.tf == 1), cfg, out)
+    engine.run_cohort(w, pop, idx, cfg, out)
     return out
 
 
-def _sharpe(out, d0, d1, start_cap):
+def _evaluate_many(pops, w5, w15, cfg, n_days, pool):
+    """Evaluate independent populations on the same window pair. Each pop
+    splits into its 5m and 15m cohorts; all cohorts run concurrently when a
+    process pool is given (pool=None falls back to serial)."""
+    tasks = [(pop, np.flatnonzero(pop.tf == tf), w)
+             for pop in pops for tf, w in ((0, w5), (1, w15))]
+    if pool is None:
+        rets = [_eval_cohort(w, pop, idx, cfg, n_days) for pop, idx, w in tasks]
+    else:
+        futs = [pool.submit(_eval_cohort, w, pop, idx, cfg, n_days)
+                for pop, idx, w in tasks]
+        rets = [f.result() for f in futs]
+    outs = []
+    for j, pop in enumerate(pops):
+        out = _alloc(pop.n, n_days)
+        for (_, idx, _), ret in zip(tasks[2 * j:2 * j + 2], rets[2 * j:2 * j + 2]):
+            for k in out:
+                out[k][idx] = ret[k][idx]
+        outs.append(out)
+    return outs
+
+
+def _fill_eq(out, d0, d1, start_cap):
     eq = out["daily"][:, d0:d1].astype(np.float64)
     bad = ~np.isfinite(eq[:, 0])
     eq[bad, 0] = start_cap
     for j in range(1, eq.shape[1]):
         col = eq[:, j]
         col[~np.isfinite(col)] = eq[:, j - 1][~np.isfinite(col)]
+    return eq
+
+
+def _sharpe(out, d0, d1, start_cap):
+    eq = _fill_eq(out, d0, d1, start_cap)
     with np.errstate(divide="ignore", invalid="ignore"):
         r = np.diff(eq, axis=1) / np.where(eq[:, :-1] == 0, np.nan, eq[:, :-1])
         mu, sd = np.nanmean(r, axis=1), np.nanstd(r, axis=1)
         return np.where(sd > 0, mu / sd * np.sqrt(365.0), np.nan)
 
 
-def _fitness(out, d0, d1, start_cap):
+def _fitness(out, d0, d1, start_cap, mode="sharpe", min_expo=0.15):
+    """'sharpe': risk-adjusted (rewards sheltering when everything loses).
+    'return': window return with a hard participation floor — a bot below
+    `min_expo` time-in-market takes a penalty up to -25 return-points, so
+    hiding in cash stops being a winning strategy."""
     sh = _sharpe(out, d0, d1, start_cap)
     trades = out["trades_a"] + out["trades_b"]
-    fit = np.where(np.isfinite(sh), sh, -9.0)
-    fit = fit - 2.0 * (trades < 10) - 4.0 * out["dead"]
+    if mode == "sharpe":
+        fit = np.where(np.isfinite(sh), sh, -9.0)
+        fit = fit - 2.0 * (trades < 10) - 4.0 * out["dead"]
+    else:
+        eq = _fill_eq(out, d0, d1, start_cap)
+        ret = (eq[:, -1] / eq[:, 0] - 1.0) * 100.0
+        bars = np.maximum(out["bars_a"] + out["bars_b"], 1)
+        expo = (out["expo_a"] + out["expo_b"]) / bars
+        shortfall = np.clip((min_expo - expo) / max(min_expo, 1e-9), 0.0, 1.0)
+        fit = ret - 25.0 * shortfall - 40.0 * out["dead"]
     return fit, sh, trades
 
 
@@ -125,6 +167,16 @@ def cmd_evolve(args) -> None:
            "start_capital": args.start_capital, "ruin_frac": args.ruin,
            "seed": args.seed}
 
+    # 8 = max concurrent cohorts (final test: 4 pops x 2 timeframes);
+    # threads suffice when the numba kernel (nogil) is active
+    n_jobs = args.jobs if args.jobs > 0 else min(8, os.cpu_count() or 1)
+    if n_jobs <= 1:
+        pool = None
+    elif engine.numba is not None:
+        pool = ThreadPoolExecutor(max_workers=n_jobs)
+    else:
+        pool = ProcessPoolExecutor(max_workers=n_jobs)
+
     evolved = genome.sample(args.bots, n_feat, names, 0.0, args.seed,
                             maker_only=args.maker_only)
     placebo = genome.sample(args.bots, n_feat, names, 0.0, args.seed + 1000,
@@ -134,7 +186,8 @@ def cmd_evolve(args) -> None:
     hof, gen_stats = [], []
 
     print(f"[{run_id}] {args.bots} bots/lineage, {args.gens} fitness windows, "
-          f"test reserved from {np.datetime64(int(test_t0), 'ms').astype('datetime64[D]')}")
+          f"{n_jobs} worker(s), test reserved from "
+          f"{np.datetime64(int(test_t0), 'ms').astype('datetime64[D]')}")
     for gen in range(args.gens):
         t0, t1 = int(bounds[gen]), int(bounds[gen + 1])
         w5, i0_5, _ = _window(mkt5, ts5, t0, t1, qs)
@@ -144,9 +197,12 @@ def cmd_evolve(args) -> None:
         row = {"gen": gen, "window": [str(np.datetime64(t0, 'ms').astype('datetime64[D]')),
                                       str(np.datetime64(t1, 'ms').astype('datetime64[D]'))]}
         fits = {}
-        for name, pop in (("evolved", evolved), ("placebo", placebo)):
-            out = _evaluate(pop, w5, w15, cfg, len(all_days))
-            fit, sh, trades = _fitness(out, d0, d1, args.start_capital)
+        lineages = (("evolved", evolved), ("placebo", placebo))
+        outs = _evaluate_many([p for _, p in lineages], w5, w15, cfg,
+                              len(all_days), pool)
+        for (name, _), out in zip(lineages, outs):
+            fit, sh, trades = _fitness(out, d0, d1, args.start_capital,
+                                       args.fitness, args.min_expo)
             fits[name] = fit
             row[name] = {"median_sharpe": round(float(np.nanmedian(sh)), 3),
                          "p90_sharpe": round(float(np.nanpercentile(sh, 90)), 3),
@@ -174,10 +230,17 @@ def cmd_evolve(args) -> None:
                           maker_only=args.maker_only)
     hof_pop = genome.concat(hof)
     final = {}
-    for name, pop in (("evolved", evolved), ("placebo", placebo),
-                      ("fresh_random", fresh), ("hall_of_fame", hof_pop)):
-        out = _evaluate(pop, w5t, w15t, cfg, len(all_days))
+    cohorts = (("evolved", evolved), ("placebo", placebo),
+               ("fresh_random", fresh), ("hall_of_fame", hof_pop))
+    test_outs = _evaluate_many([p for _, p in cohorts], w5t, w15t, cfg,
+                               len(all_days), pool)
+    if pool is not None:
+        pool.shutdown()
+    for (name, pop), out in zip(cohorts, test_outs):
         sh = _sharpe(out, d0t, d1t, args.start_capital)
+        eqt = _fill_eq(out, d0t, d1t, args.start_capital)
+        ret = (eqt[:, -1] / eqt[:, 0] - 1.0) * 100.0
+        expo = (out["expo_a"] + out["expo_b"]) / np.maximum(out["bars_a"] + out["bars_b"], 1)
         trades = out["trades_a"] + out["trades_b"]
         okm = np.isfinite(sh) & (trades >= 8)
         final[name] = {
@@ -186,6 +249,8 @@ def cmd_evolve(args) -> None:
             "p90_sharpe": round(float(np.nanpercentile(sh[okm], 90)), 3) if okm.any() else None,
             "max_sharpe": round(float(np.nanmax(sh[okm])), 3) if okm.any() else None,
             "pct_positive": round(float((sh[okm] > 0).mean() * 100), 1) if okm.any() else None,
+            "median_ret_pct": round(float(np.median(ret)), 2),
+            "median_expo_pct": round(float(np.median(expo) * 100), 1),
             "dead_pct": round(float(out["dead"].mean() * 100), 1),
         }
         if name == "hall_of_fame":
@@ -203,6 +268,7 @@ def cmd_evolve(args) -> None:
                       - final["placebo"]["median_sharpe"], 3)
 
     result = {"run_id": run_id, "seed": args.seed, "bots": args.bots,
+              "fitness": args.fitness, "min_expo": args.min_expo,
               "gens": args.gens, "test_frac": args.test_frac,
               "test_start": str(np.datetime64(int(test_t0), 'ms')),
               "maker_only": bool(args.maker_only), "taker_bps": args.taker_bps,
@@ -215,6 +281,8 @@ def cmd_evolve(args) -> None:
     print("\n  RESERVED TEST SPAN (never used for selection):")
     for name, r in final.items():
         print(f"    {name:14s} median S {r['median_sharpe']} | p90 {r['p90_sharpe']} "
-              f"| max {r['max_sharpe']} | {r['pct_positive']}% positive | dead {r['dead_pct']}%")
+              f"| max {r['max_sharpe']} | {r['pct_positive']}% positive "
+              f"| median ret {r['median_ret_pct']}% | expo {r['median_expo_pct']}% "
+              f"| dead {r['dead_pct']}%")
     print(f"  SKILL vs placebo (median-S difference): {skill}")
     print(f"  artifacts: {run_dir}  ({result['elapsed_s']}s)")

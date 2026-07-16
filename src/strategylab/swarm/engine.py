@@ -18,6 +18,11 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    import numba
+except ImportError:  # pure-numpy fallback path below
+    numba = None
+
 MAX_LEV = 3.0
 WARMUP = 300
 
@@ -37,9 +42,184 @@ def _interp_thresholds(rule_feat, rule_q, Q, qs):
     return (v_lo * (1 - w) + v_hi * w).astype(np.float64)
 
 
-def run_cohort(mkt, g, idx, cfg, out, progress=None):
+def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
+                is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
+                thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
+                order_ttl, loss_react, cooldown_len, revenge, reentry_gap,
+                sess_ok_bot, rng, taker, edge, start_cap, ruin, n_days):
+    """JIT bar loop. Mirrors the vectorized numpy path op-for-op per element,
+    so both paths (and any chunking of the cohort) are bit-identical — numba
+    implements np.random.Generator with numpy's exact bitstream."""
+    m = is_ctrl.shape[0]
+    n_bars = c.shape[0]
+    R = rule_feat.shape[1]
+
+    pos = np.zeros(m, np.int64)
+    entry = np.zeros(m, np.float64)
+    qty = np.zeros(m, np.float64)
+    stop_px = np.zeros(m, np.float64)
+    tp_px = np.zeros(m, np.float64)
+    held = np.zeros(m, np.int64)
+    pk = np.zeros(m, np.int64)          # pending: 0 none / 1 market / 2 limit
+    pdir = np.zeros(m, np.int64)
+    ppx = np.zeros(m, np.float64)
+    pttl = np.zeros(m, np.int64)
+    cd = np.zeros(m, np.int64)
+    rmult = np.ones(m, np.float64)
+    gap_until = np.zeros(m, np.int64)
+    eq = np.full(m, start_cap, np.float64)
+    dead = np.zeros(m, np.bool_)
+    elig = np.zeros(m, np.bool_)
+
+    daily = np.full((m, n_days), np.nan, np.float32)
+    trades = np.zeros((m, 2), np.int64)
+    wins = np.zeros((m, 2), np.int64)
+    expo = np.zeros((m, 2), np.int64)
+    death_day = np.full(m, -1, np.int64)
+    u = np.zeros(m, np.float64)
+    r2 = np.zeros(m, np.float64)
+
+    def open_pos(i, raw, eff, at):
+        d = float(pdir[i])
+        dist = stop_atr[i] * at
+        # numpy semantics for ATR=0 bars: q -> inf, then the leverage cap wins
+        q = eq[i] * risk[i] * rmult[i] / dist if dist > 0.0 else np.inf
+        cap = MAX_LEV * eq[i] / raw
+        if q > cap:
+            q = cap
+        pos[i] = pdir[i]
+        entry[i] = eff
+        qty[i] = q
+        stop_px[i] = raw - d * dist
+        rr = tp_rr[i]
+        tp_px[i] = raw + d * rr * dist if np.isfinite(rr) else d * np.inf
+        held[i] = 0
+        pk[i] = 0
+
+    def close_pos(i, exit_eff, t, seg):
+        pnl = qty[i] * (exit_eff - entry[i]) * pos[i]
+        eq[i] += pnl
+        trades[i, seg] += 1
+        if pnl > 0:
+            wins[i, seg] += 1
+            rmult[i] = 1.0
+        else:
+            if loss_react[i] == 1:
+                cd[i] = cooldown_len[i]
+            rmult[i] = revenge[i] if loss_react[i] == 2 else 1.0
+        gap_until[i] = t + reentry_gap[i]
+        pos[i] = 0
+        qty[i] = 0.0
+        held[i] = 0
+        if eq[i] < ruin:  # ruin line
+            dead[i] = True
+            death_day[i] = day_pos[t]
+            pk[i] = 0
+
+    for t in range(WARMUP, n_bars):
+        ot, ht, lt, ct, at = o[t], h[t], l[t], c[t], A[t]
+        seg = 1 if seg_b[t] else 0
+        hr = hour[t]
+        any_ctl = False
+
+        for i in range(m):
+            # -- 1. fill pending orders placed on earlier bars ------------
+            if pk[i] > 0 and not dead[i] and pos[i] == 0:
+                if pk[i] == 1:                        # market @ open, taker
+                    open_pos(i, ot, ot * (1.0 + pdir[i] * taker), at)
+                elif (lt <= ppx[i]) if pdir[i] > 0 else (ht >= ppx[i]):
+                    open_pos(i, ppx[i], ppx[i] * (1.0 + pdir[i] * edge), at)
+                else:                                 # resting limit ages
+                    pttl[i] -= 1
+                    if pttl[i] <= 0:
+                        pk[i] = 0
+
+            # -- 2. exits (stop wins over TP within one bar) ---------------
+            if pos[i] != 0 and held[i] >= 1:
+                long = pos[i] > 0
+                if (lt <= stop_px[i]) if long else (ht >= stop_px[i]):
+                    close_pos(i, stop_px[i] * (1.0 - pos[i] * taker), t, seg)
+                elif (ht >= tp_px[i]) if long else (lt <= tp_px[i]):
+                    close_pos(i, tp_px[i] * (1.0 - pos[i] * edge), t, seg)
+                elif held[i] >= max_hold[i]:
+                    close_pos(i, ct * (1.0 - pos[i] * taker), t, seg)
+
+            # -- eligibility for new entries -------------------------------
+            e = (not dead[i] and pos[i] == 0 and pk[i] == 0 and cd[i] == 0
+                 and t >= gap_until[i] and sess_ok_bot[i, hr])
+            elig[i] = e
+            if e and is_ctrl[i]:
+                any_ctl = True
+
+        # control draws: full-size arrays, only on bars where a control bot
+        # is eligible — replicates the numpy path's RNG consumption exactly
+        if any_ctl:
+            u = rng.random(m)
+            r2 = rng.random(m)
+
+        write_day = t + 1 >= n_bars or day_pos[t + 1] != day_pos[t]
+        for i in range(m):
+            # -- 3. new entries (decided at close, fill from next bar) ----
+            if elig[i]:
+                des = 0
+                if is_ctrl[i]:
+                    if u[i] < ctrl_rate[i]:
+                        des = 1 if r2[i] < 0.5 else -1
+                else:
+                    sig = 0
+                    for r in range(R):
+                        if not rule_act[i, r]:
+                            continue
+                        v = F[t, rule_feat[i, r]]
+                        if not np.isfinite(v):
+                            continue
+                        if (v > thr[i, r]) if rule_op_gt[i, r] else (v < thr[i, r]):
+                            sig += rule_dir[i, r]
+                    des = 1 if sig > 0 else (-1 if sig < 0 else 0)
+                if des > 0 and dir_bias[i] < 0:   # ideology direction filter
+                    des = 0
+                elif des < 0 and dir_bias[i] > 0:
+                    des = 0
+                if des != 0:
+                    pdir[i] = des
+                    if maker_off[i] == 0.0:       # taker chase
+                        pk[i] = 1
+                        pttl[i] = 1
+                    else:                          # resting maker limit
+                        pk[i] = 2
+                        ppx[i] = ct - des * maker_off[i] * at
+                        pttl[i] = order_ttl[i]
+
+            # -- 4. bookkeeping -------------------------------------------
+            if cd[i] > 0:
+                cd[i] -= 1
+            if pos[i] != 0:
+                held[i] += 1
+                expo[i, seg] += 1
+            if write_day:
+                daily[i, day_pos[t]] = eq[i] + qty[i] * (ct - entry[i]) * pos[i]
+
+    # mark-to-market close of anything still open (taker at last close)
+    for i in range(m):
+        if pos[i] != 0:
+            eq[i] += qty[i] * (c[n_bars - 1] * (1.0 - pos[i] * taker)
+                               - entry[i]) * pos[i]
+
+    return daily, trades, wins, expo, eq, dead, death_day
+
+
+if numba is not None:
+    # nogil: kernel runs outside the GIL, so cohort chunks parallelize on
+    # plain threads — no process spawn, no market pickling, shared memory
+    _bar_kernel = numba.njit(cache=True, nogil=True)(_bar_kernel)
+
+
+def run_cohort(mkt, g, idx, cfg, out, progress=None, rng_salt=0):
     """Simulate the cohort of bots `idx` (indices into genome arrays) on one
     timeframe's market dict, writing per-bot results into `out`.
+
+    rng_salt distinguishes the control-bot RNG stream when a cohort is split
+    into parallel chunks; salt 0 preserves the original single-cohort stream.
 
     mkt keys: o,h,l,c,atr (float64), hour (int 0-23), day_pos (int index into
     the global day grid), seg_b (bool: bar in test segment), F (float32
@@ -50,7 +230,6 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None):
         return
     o, h, l, c = mkt["o"], mkt["h"], mkt["l"], mkt["c"]
     A, hour, day_pos, seg_b, F = mkt["atr"], mkt["hour"], mkt["day_pos"], mkt["seg_b"], mkt["F"]
-    n_bars = len(c)
 
     taker = cfg["taker_bps"] / 1e4
     edge = cfg["maker_bps"] / 1e4
@@ -83,7 +262,37 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None):
         sess_tab[k, s:e] = True
     sess_ok_bot = sess_tab[g.session[idx].astype(np.int64)]  # [m, 24]
 
-    rng = np.random.default_rng(cfg["seed"] * 7919 + int(mkt["tf_code"]))
+    rng = np.random.default_rng(cfg["seed"] * 7919 + int(mkt["tf_code"]) + rng_salt)
+
+    fn = _bar_kernel if numba is not None else _bar_loop_py
+    daily, trades, wins, expo, eq, dead, death_day = fn(
+        o, h, l, c, A, hour, day_pos, seg_b, F,
+        is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
+        thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
+        order_ttl, loss_react.astype(np.int64), cooldown_len, revenge,
+        reentry_gap, sess_ok_bot, rng, taker, edge, start_cap, ruin,
+        out["daily"].shape[1])
+
+    out["daily"][idx] = daily
+    out["final_eq"][idx] = eq
+    out["trades_a"][idx], out["trades_b"][idx] = trades[:, 0], trades[:, 1]
+    out["wins_a"][idx], out["wins_b"][idx] = wins[:, 0], wins[:, 1]
+    out["expo_a"][idx], out["expo_b"][idx] = expo[:, 0], expo[:, 1]
+    out["bars_a"][idx] = int((~seg_b[WARMUP:]).sum())
+    out["bars_b"][idx] = int(seg_b[WARMUP:].sum())
+    out["death_day"][idx] = death_day
+    out["dead"][idx] = dead
+
+
+def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
+                 is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
+                 thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
+                 order_ttl, loss_react, cooldown_len, revenge, reentry_gap,
+                 sess_ok_bot, rng, taker, edge, start_cap, ruin, n_days):
+    """Pure-numpy fallback bar loop (used when numba is not installed).
+    Bit-identical to _bar_kernel."""
+    m = is_ctrl.shape[0]
+    n_bars = len(c)
 
     # --- state -----------------------------------------------------------
     pos = np.zeros(m, dtype=np.int64)         # -1 / 0 / +1
@@ -102,6 +311,7 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None):
     eq = np.full(m, start_cap, dtype=np.float64)
     dead = np.zeros(m, dtype=bool)
 
+    daily = np.full((m, n_days), np.nan, dtype=np.float32)
     trades = np.zeros((m, 2), dtype=np.int64)   # col 0=train, 1=test
     wins = np.zeros((m, 2), dtype=np.int64)
     expo = np.zeros((m, 2), dtype=np.int64)
@@ -217,20 +427,11 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None):
         expo[in_pos, 1 if seg_b[t] else 0] += 1
 
         if t + 1 >= n_bars or day_pos[t + 1] != day_pos[t]:
-            out["daily"][idx, day_pos[t]] = eq + qty * (ct - entry) * pos
-        if progress is not None and t % 4000 == 0:
-            progress(t / n_bars)
+            daily[:, day_pos[t]] = eq + qty * (ct - entry) * pos
 
     # mark-to-market close of anything still open (taker at last close)
     open_ = np.flatnonzero(pos != 0)
     if len(open_):
         eq[open_] += qty[open_] * (c[-1] * (1 - pos[open_] * taker) - entry[open_]) * pos[open_]
 
-    out["final_eq"][idx] = eq
-    out["trades_a"][idx], out["trades_b"][idx] = trades[:, 0], trades[:, 1]
-    out["wins_a"][idx], out["wins_b"][idx] = wins[:, 0], wins[:, 1]
-    out["expo_a"][idx], out["expo_b"][idx] = expo[:, 0], expo[:, 1]
-    out["bars_a"][idx] = int((~seg_b[WARMUP:]).sum())
-    out["bars_b"][idx] = int(seg_b[WARMUP:].sum())
-    out["death_day"][idx] = death_day
-    out["dead"][idx] = dead
+    return daily, trades, wins, expo, eq, dead, death_day

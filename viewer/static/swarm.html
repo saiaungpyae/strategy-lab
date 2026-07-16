@@ -92,9 +92,11 @@
 </div>
 <div class="tabs" id="tabs">
   <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="bots">Bots</button>
   <button data-tab="traits">Traits</button>
   <button data-tab="persistence">Persistence</button>
   <button data-tab="leaderboard">Leaderboard</button>
+  <button data-tab="evolution">Evolution</button>
 </div>
 <div class="wrap" id="content"><div class="empty">loading…</div></div>
 
@@ -378,6 +380,8 @@ function renderLeaderboard(el) {
       <td>${r.tf}</td><td>${r.session}</td><td>${fmt(r.risk_pct, 2)}%</td>
       <td class="muted">${fmt(r.sharpe_a, 2)}</td>
       <td><b class="${r.sharpe_b >= 0 ? 'pos' : 'neg'}">${fmt(r.sharpe_b, 2)}</b></td>
+      <td class="${r.final_usd >= RECAP.config.start_capital ? 'pos' : 'neg'}">
+        ${r.final_usd == null ? '—' : '$' + (+r.final_usd).toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
       <td class="muted">${fmt(r.ret_a, 1)}%</td>
       <td class="${r.ret_b >= 0 ? 'pos' : 'neg'}">${fmt(r.ret_b, 1)}%</td>
       <td>${fmt(r.maxdd_b, 1)}%</td><td>${r.trades}</td><td>${fmt(r.expo_b_pct, 0)}%</td>
@@ -389,8 +393,8 @@ function renderLeaderboard(el) {
     <div class="card scroll" style="padding:0">
       <table>
         <thead><tr><th>#</th><th>bot</th><th class="l">ideology (sampled rules)</th><th>tf</th>
-          <th>session</th><th>risk</th><th>S(train)</th><th>S(test)</th><th>ret(train)</th>
-          <th>ret(test)</th><th>maxDD(test)</th><th>trades</th><th>expo(test)</th></tr></thead>
+          <th>session</th><th>risk</th><th>S(train)</th><th>S(test)</th><th>final $</th>
+          <th>ret(train)</th><th>ret(test)</th><th>maxDD(test)</th><th>trades</th><th>expo(test)</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>`;
   el.querySelectorAll('tr.click').forEach(tr =>
@@ -409,12 +413,20 @@ async function openBot(botId) {
     if (typeof v === 'number' && !Number.isInteger(v)) v = fmt(v, 3);
     return `<b>${k}</b><span>${v ?? '—'}</span>`;
   }).join('');
+  const startCap = RECAP ? +RECAP.config.start_capital : 10000;
+  const finalUsd = res.final_mult == null ? null : res.final_mult * startCap;
+  const money = v => v == null ? '—' : '$' + (+v).toLocaleString(undefined,
+    { minimumFractionDigits: 0, maximumFractionDigits: 0 });
   dlg.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:baseline">
       <h2 style="margin:0;font-size:16px">Bot #${botId}
         ${g.is_control ? '<span class="chip gray">CONTROL</span>' : ''}
         ${res.dead ? '<span class="chip red">DEAD</span>' : ''}</h2>
-      <button onclick="this.closest('dialog').close()">close</button></div>
+      <span>
+        <span class="${finalUsd >= startCap ? 'pos' : 'neg'}" style="font-size:17px;font-weight:650">
+          ${money(finalUsd)}</span>
+        <span class="muted"> of ${money(startCap)} (x${fmt(res.final_mult, 3)})</span>
+        <button style="margin-left:12px" onclick="this.closest('dialog').close()">close</button></span></div>
     <p class="rules" style="max-width:none;white-space:normal"><b>Ideology:</b> ${g.rules}</p>
     <div style="display:grid;grid-template-columns:280px 1fr;gap:18px">
       <div class="kv">
@@ -422,15 +434,173 @@ async function openBot(botId) {
                  'maker_off_atr', 'order_ttl', 'session', 'loss_react', 'cooldown_bars',
                  'revenge_mult', 'reentry_gap'])}
         <b>—</b><span></span>
-        ${kv(res, ['trades_a', 'trades_b', 'sharpe_a', 'sharpe_b', 'final_mult', 'maxdd_b', 'death_day'])}
+        ${kv(res, ['trades_a', 'trades_b', 'sharpe_a', 'sharpe_b', 'maxdd_b', 'death_day'])}
       </div>
       <div><h3 style="margin:0 0 6px;font-size:12px;color:var(--muted)">EQUITY (train | test)</h3>
-        <div id="botEq"></div></div>
+        <div id="botEq"></div>
+        <h3 style="margin:12px 0 6px;font-size:12px;color:var(--muted)">YEAR BY YEAR</h3>
+        <div class="scroll"><table><thead><tr>
+          ${(b.yearly || []).map(y => `<th>${y.year}</th>`).join('')}
+        </tr></thead><tbody><tr>
+          ${(b.yearly || []).map(y => `<td class="${y.ret_pct >= 0 ? 'pos' : 'neg'}">${fmt(y.ret_pct, 1)}%</td>`).join('')}
+        </tr><tr>
+          ${(b.yearly || []).map(y => `<td class="muted">${money(y.end_usd)}</td>`).join('')}
+        </tr></tbody></table></div></div>
     </div>`;
   const si = b.days.findIndex(d => d >= b.split_day);
   window.__splitIdx = si;
   lines($('#botEq'), b.days, [{ v: b.equity, c: C.up }], 260, v => 'x' + fmt(v / RECAP.config.start_capital, 2));
   window.__splitIdx = null;
+}
+
+let BOTS = null, botSort = { k: 'final_usd', d: -1 }, botPage = 0, botFilter = '';
+const PAGE = 250;
+async function renderBots(el) {
+  if (!BOTS || BOTS.run !== RUN_ID) {
+    el.innerHTML = '<div class="empty">loading bots…</div>';
+    const r = await fetch(`/api/swarm/bots?id=${RUN_ID}`);
+    const j = await r.json();
+    if (j.error) { el.innerHTML = `<div class="empty">${j.error}</div>`; return; }
+    const b = j.bots, rows = [];
+    for (let i = 0; i < j.n; i++) rows.push({
+      bot_id: b.bot_id[i], control: b.control[i], tf: b.tf[i], session: b.session[i],
+      rules: b.rules[i], final_usd: b.final_usd[i], ret_a: b.ret_a[i], ret_b: b.ret_b[i],
+      sharpe_b: b.sharpe_b[i], trades: b.trades[i], dead: b.dead[i] });
+    BOTS = { run: RUN_ID, rows, start: j.start_capital };
+    botPage = 0;
+  }
+  const f = botFilter.toLowerCase();
+  let rows = BOTS.rows;
+  if (f) rows = rows.filter(r => String(r.bot_id) === f
+    || r.rules.toLowerCase().includes(f) || r.tf === f || r.session.toLowerCase() === f
+    || (f === 'dead' && r.dead) || (f === 'control' && r.control) || (f === 'alive' && !r.dead));
+  const k = botSort.k, dir = botSort.d;
+  rows = [...rows].sort((a, b) => {
+    const va = a[k], vb = b[k];
+    if (va == null) return 1; if (vb == null) return -1;
+    return (typeof va === 'string' ? va.localeCompare(vb) : va - vb) * dir;
+  });
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  botPage = Math.min(botPage, pages - 1);
+  const page = rows.slice(botPage * PAGE, (botPage + 1) * PAGE);
+  const money = v => v == null ? '—' : '$' + (+v).toLocaleString(undefined,
+    { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  const arrow = c => botSort.k === c ? (botSort.d < 0 ? ' ▾' : ' ▴') : '';
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input id="botFilter" placeholder="filter: rules text, bot id, 5m/15m, session, dead, alive, control"
+        style="flex:1;min-width:260px" value="${botFilter.replaceAll('"', '&quot;')}">
+      <span class="muted">${rows.length.toLocaleString()} bots · started at ${money(BOTS.start)} each ·
+        click a column to sort, a row for detail</span>
+      <span>
+        <button id="pgPrev" ${botPage === 0 ? 'disabled' : ''}>‹</button>
+        <span class="muted"> ${botPage + 1}/${pages} </span>
+        <button id="pgNext" ${botPage >= pages - 1 ? 'disabled' : ''}>›</button></span>
+    </div>
+    <div class="card scroll" style="padding:0">
+      <table><thead><tr>
+        <th data-k="bot_id">bot${arrow('bot_id')}</th>
+        <th class="l" data-k="rules">ideology${arrow('rules')}</th>
+        <th data-k="tf">tf${arrow('tf')}</th>
+        <th data-k="session">session${arrow('session')}</th>
+        <th data-k="final_usd">final $${arrow('final_usd')}</th>
+        <th data-k="ret_a">ret(train)${arrow('ret_a')}</th>
+        <th data-k="ret_b">ret(test)${arrow('ret_b')}</th>
+        <th data-k="sharpe_b">S(test)${arrow('sharpe_b')}</th>
+        <th data-k="trades">trades${arrow('trades')}</th>
+      </tr></thead><tbody>
+      ${page.map(r => `<tr class="click" data-bot="${r.bot_id}">
+        <td>#${r.bot_id}${r.control ? '<span class="chip gray">C</span>' : ''}${r.dead ? '<span class="chip red">✝</span>' : ''}</td>
+        <td class="l rules" title="${r.rules.replaceAll('"', '&quot;')}">${r.rules}</td>
+        <td>${r.tf}</td><td>${r.session}</td>
+        <td class="${r.final_usd >= BOTS.start ? 'pos' : 'neg'}"><b>${money(r.final_usd)}</b></td>
+        <td class="muted">${fmt(r.ret_a, 1)}%</td>
+        <td class="${r.ret_b >= 0 ? 'pos' : 'neg'}">${fmt(r.ret_b, 1)}%</td>
+        <td>${r.sharpe_b == null ? '—' : fmt(r.sharpe_b, 2)}</td>
+        <td>${r.trades}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  el.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click', () => {
+    const kk = th.dataset.k;
+    botSort = { k: kk, d: botSort.k === kk ? -botSort.d : -1 };
+    renderBots(el);
+  }));
+  el.querySelectorAll('tr.click').forEach(tr =>
+    tr.addEventListener('click', () => openBot(+tr.dataset.bot)));
+  const fi = $('#botFilter');
+  fi.addEventListener('input', () => {
+    clearTimeout(window.__bf);
+    window.__bf = setTimeout(() => { botFilter = fi.value.trim(); botPage = 0; renderBots(el); }, 250);
+  });
+  fi.focus(); fi.setSelectionRange(fi.value.length, fi.value.length);
+  $('#pgPrev').addEventListener('click', () => { botPage--; renderBots(el); });
+  $('#pgNext').addEventListener('click', () => { botPage++; renderBots(el); });
+}
+
+let EVOS = null;
+async function renderEvolution(el) {
+  if (!EVOS) {
+    el.innerHTML = '<div class="empty">loading evolution runs…</div>';
+    EVOS = (await (await fetch('/api/swarm/evos')).json()).evos;
+  }
+  if (!EVOS.length) {
+    el.innerHTML = '<div class="empty">No evolution runs yet — run <code>sl-swarm evolve</code>.</div>';
+    return;
+  }
+  const e = EVOS.find(x => x.run_id === window.__evoSel) || EVOS[0];
+  const ft = e.final_test || {};
+  const groups = ['evolved', 'placebo', 'fresh_random', 'hall_of_fame'];
+  const g = k => ft[k] || {};
+  const v = (x, d=2) => x == null ? '—' : (+x).toFixed(d);
+  el.innerHTML = `
+    <div class="grid">
+      <div class="card" style="grid-column:span 12; display:flex; gap:16px; align-items:center; flex-wrap:wrap">
+        <select id="evoSel">${EVOS.map(x =>
+          `<option value="${x.run_id}" ${x.run_id === e.run_id ? 'selected' : ''}>${x.run_id} · ${x.fitness || 'sharpe'} fitness</option>`).join('')}</select>
+        <span class="muted">${e.bots} bots/lineage · ${e.gens} walk-forward windows · seed ${e.seed}
+          · costs ${e.maker_bps}bp maker / ${e.taker_bps}bp taker · test reserved from ${(e.test_start || '').slice(0, 10)}</span>
+        <span class="chip">skill vs placebo: ${v(e.skill_vs_placebo)}</span>
+      </div>
+      <div class="card" style="grid-column:span 7">
+        <h3>Generation-by-generation divergence</h3>
+        <div class="sub">median fitness-window Sharpe per generation — selection (teal) vs
+          random-selection placebo (gray). Each generation is scored on a window that played
+          no role in creating it.</div>
+        <div id="evoChart"></div>
+        <div class="legend" style="margin-top:6px">
+          <span><i style="background:${C.up}"></i>evolved</span>
+          <span><i style="background:${C.muted}"></i>placebo</span></div>
+      </div>
+      <div class="card" style="grid-column:span 5">
+        <h3>Reserved test span</h3>
+        <div class="sub">never used for any selection · the placebo row is what
+          breeding-without-selection achieves</div>
+        <div class="scroll"><table><thead><tr><th class="l">group</th><th>median S</th>
+          <th>p90</th><th>% pos</th><th>ret</th><th>dead</th></tr></thead><tbody>
+          ${groups.map(k => `<tr><td class="l">${k.replaceAll('_', ' ')}</td>
+            <td class="${(g(k).median_sharpe ?? 0) >= 0 ? 'pos' : 'neg'}"><b>${v(g(k).median_sharpe)}</b></td>
+            <td>${v(g(k).p90_sharpe)}</td><td>${v(g(k).pct_positive, 1)}%</td>
+            <td>${g(k).median_ret_pct == null ? '—' : v(g(k).median_ret_pct, 1) + '%'}</td>
+            <td>${v(g(k).dead_pct, 1)}%</td></tr>`).join('')}
+        </tbody></table></div>
+      </div>
+      <div class="card scroll" style="grid-column:span 12; padding:0">
+        <table><thead><tr><th>gen</th><th class="l">ideology (hall of fame, by test Sharpe)</th>
+          <th>tf</th><th>session</th><th>risk</th><th>test S</th><th>test trades</th></tr></thead>
+          <tbody>${(e.hof_top || []).map(h => `<tr><td>${h.born_gen}</td>
+            <td class="l rules" title="${String(h.rules).replaceAll('"', '&quot;')}">${h.rules}</td>
+            <td>${h.tf}</td><td>${h.session}</td><td>${v(h.risk_pct, 2)}%</td>
+            <td class="${+h.test_sharpe >= 0 ? 'pos' : 'neg'}"><b>${v(h.test_sharpe)}</b></td>
+            <td>${h.test_trades}</td></tr>`).join('')}</tbody></table>
+      </div>
+    </div>`;
+  const gs = e.gen_stats || [];
+  lines($('#evoChart'), gs.map(x => x.window[1]),
+    [{ v: gs.map(x => x.evolved.median_sharpe), c: C.up },
+     { v: gs.map(x => x.placebo.median_sharpe), c: C.muted }],
+    240, x => fmt(x, 1));
+  $('#evoSel').addEventListener('change', ev => {
+    window.__evoSel = ev.target.value; renderEvolution(el);
+  });
 }
 
 // ------------------------------------------------------------- data flow --
@@ -465,8 +635,10 @@ async function loadRecap() {
   render();
 }
 function render() {
-  if (!RECAP) return;
   const el = $('#content');
+  if (TAB === 'evolution') { renderEvolution(el); return; }
+  if (!RECAP) return;
+  if (TAB === 'bots') { renderBots(el); return; }
   ({ overview: renderOverview, traits: renderTraits,
      persistence: renderPersistence, leaderboard: renderLeaderboard })[TAB](el);
 }
@@ -479,7 +651,7 @@ $('#tabs').addEventListener('click', e => {
     render();
   }
 });
-$('#runSel').addEventListener('change', e => { RUN_ID = e.target.value; RECAP = null; loadRecap(); });
+$('#runSel').addEventListener('change', e => { RUN_ID = e.target.value; RECAP = null; BOTS = null; loadRecap(); });
 $('#newRunBtn').addEventListener('click', () => $('#newRunPanel').classList.toggle('open'));
 $('#nrGo').addEventListener('click', async () => {
   const body = { bots: +$('#nrBots').value, since: $('#nrSince').value.trim(),

@@ -441,6 +441,121 @@ def reports_payload() -> dict:
     return {"reports": items}
 
 
+_MD_CSS = """
+:root{--bg:#0e1117;--panel:#161b22;--border:#2a2f38;--text:#e6edf3;--muted:#8b949e;
+--accent:#26a69a;--warn:#f0b429}
+body{margin:0;background:var(--bg);color:var(--text);
+font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:920px;margin:0 auto;padding:28px 20px 80px}
+h1,h2,h3{line-height:1.3}h1{font-size:24px}h2{font-size:18px;margin-top:32px;
+border-bottom:1px solid var(--border);padding-bottom:6px}h3{font-size:15px}
+a{color:var(--accent);text-decoration:none}
+code{background:#21262d;border:1px solid var(--border);border-radius:4px;
+padding:1px 5px;font-size:12.5px}
+pre{background:#21262d;border:1px solid var(--border);border-radius:8px;
+padding:12px;overflow-x:auto}pre code{border:none;background:none;padding:0}
+table{border-collapse:collapse;margin:14px 0;font-size:13px;display:block;
+overflow-x:auto;max-width:100%}
+th,td{border:1px solid var(--border);padding:6px 10px;text-align:right;
+white-space:nowrap}th:first-child,td:first-child{text-align:left}
+th{background:var(--panel);color:var(--muted)}
+blockquote{border-left:3px solid var(--warn);margin:14px 0;padding:4px 14px;
+color:var(--muted);background:rgba(240,180,41,.06)}
+hr{border:none;border-top:1px solid var(--border);margin:24px 0}
+.top{padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+"""
+
+
+def _md_inline(s: str) -> str:
+    import html as _h
+    s = _h.escape(s, quote=False)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)]+|/[^)]*|[\w./-]+)\)", r'<a href="\2">\1</a>', s)
+    return s
+
+
+def render_markdown(text: str, title: str) -> bytes:
+    """Small dependency-free renderer for the subset of markdown the lab's
+    reports use: headers, tables, lists, quotes, fences, bold, code, links."""
+    out, para, in_code, table = [], [], False, []
+
+    def flush_para():
+        if para:
+            out.append("<p>" + _md_inline(" ".join(para)) + "</p>")
+            para.clear()
+
+    def flush_table():
+        nonlocal table
+        if not table:
+            return
+        head, *body = table
+        if body and set(body[0].replace("|", "").strip()) <= set("-: "):
+            body = body[1:]
+        cells = lambda row: [c.strip() for c in row.strip().strip("|").split("|")]
+        html = ["<table><thead><tr>"]
+        html += [f"<th>{_md_inline(c)}</th>" for c in cells(head)]
+        html.append("</tr></thead><tbody>")
+        for row in body:
+            html.append("<tr>" + "".join(f"<td>{_md_inline(c)}</td>"
+                                         for c in cells(row)) + "</tr>")
+        html.append("</tbody></table>")
+        out.append("".join(html))
+        table = []
+
+    list_tag = None
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            flush_para(); flush_table()
+            out.append("<pre><code>" if not in_code else "</code></pre>")
+            in_code = not in_code
+            continue
+        if in_code:
+            import html as _h
+            out.append(_h.escape(line))
+            continue
+        if line.lstrip().startswith("|"):
+            flush_para()
+            table.append(line)
+            continue
+        flush_table()
+        stripped = line.strip()
+        m = re.match(r"^(#{1,4})\s+(.*)", stripped)
+        is_li = re.match(r"^(-|\d+\.)\s+(.*)", stripped)
+        if list_tag and not is_li:
+            out.append(f"</{list_tag}>"); list_tag = None
+        if not stripped:
+            flush_para()
+        elif m:
+            flush_para()
+            out.append(f"<h{len(m.group(1))}>{_md_inline(m.group(2))}</h{len(m.group(1))}>")
+        elif stripped.startswith(">"):
+            flush_para()
+            out.append(f"<blockquote>{_md_inline(stripped.lstrip('> '))}</blockquote>")
+        elif re.fullmatch(r"-{3,}", stripped):
+            flush_para(); out.append("<hr>")
+        elif is_li:
+            flush_para()
+            tag = "ul" if is_li.group(1) == "-" else "ol"
+            if list_tag != tag:
+                if list_tag:
+                    out.append(f"</{list_tag}>")
+                out.append(f"<{tag}>"); list_tag = tag
+            out.append(f"<li>{_md_inline(is_li.group(2))}</li>")
+        else:
+            para.append(stripped)
+    flush_para(); flush_table()
+    if list_tag:
+        out.append(f"</{list_tag}>")
+    page = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><style>{_MD_CSS}</style></head><body>"
+            f"<div class='top'><a href='/'>← dashboard</a> · <a href='/swarm'>bot swarm</a>"
+            f" · <a href='?raw=1'>raw</a></div><main>" + "\n".join(out) +
+            "</main></body></html>")
+    return page.encode()
+
+
 def safe_report_path(filename: str) -> Path | None:
     if not filename:
         return None
@@ -508,6 +623,52 @@ def _swarm_tables(run_dir: str, mtime: float):
             z["daily"], [str(x) for x in z["days"]], int(z["split_day"]))
 
 
+def swarm_evos_payload() -> dict:
+    """Evolution runs: evolution.json + top hall-of-fame rows per run."""
+    evos = []
+    if SWARM_DIR.is_dir():
+        for d in sorted(SWARM_DIR.iterdir(), reverse=True):
+            if not d.is_dir() or not (d / "evolution.json").is_file():
+                continue
+            e = _read_json(d / "evolution.json") or {}
+            hof_csv = d / "hof_test.csv"
+            if hof_csv.is_file():
+                import csv
+                with hof_csv.open() as fh:
+                    e["hof_top"] = list(csv.DictReader(fh))[:10]
+            else:
+                e["hof_top"] = []
+            evos.append(e)
+    return {"evos": evos}
+
+
+def swarm_bots_payload(run_id: str) -> dict:
+    """Compact per-bot table for the Bots tab — every bot, final $ included."""
+    d = safe_swarm_dir(run_id)
+    if d is None:
+        return {"error": "run not found"}
+    gdf, res, daily, days, split_day = _swarm_tables(
+        str(d), (d / "results.csv").stat().st_mtime)
+    cfg = _read_json(d / "config.json") or {}
+    start_cap = float(cfg.get("start_capital", 10_000.0))
+    import numpy as _np
+    out = {
+        "bot_id": res["bot_id"].tolist(),
+        "control": res["is_control"].astype(bool).tolist(),
+        "tf": gdf["tf"].tolist(),
+        "session": gdf["session"].tolist(),
+        "rules": gdf["rules"].tolist(),
+        "final_usd": _np.round(res["final_mult"].to_numpy(float) * start_cap, 2).tolist(),
+        "ret_a": _np.round(res["ret_a"].to_numpy(float) * 100, 2).tolist(),
+        "ret_b": _np.round(res["ret_b"].to_numpy(float) * 100, 2).tolist(),
+        "sharpe_b": [None if v != v else round(v, 3)
+                     for v in res["sharpe_b"].to_numpy(float)],
+        "trades": (res["trades_a"] + res["trades_b"]).tolist(),
+        "dead": res["dead"].astype(bool).tolist(),
+    }
+    return {"start_capital": start_cap, "n": len(gdf), "bots": out}
+
+
 def swarm_bot_payload(run_id: str, bot_id: int) -> dict:
     d = safe_swarm_dir(run_id)
     if d is None:
@@ -517,6 +678,20 @@ def swarm_bot_payload(run_id: str, bot_id: int) -> dict:
     if not (0 <= bot_id < len(gdf)):
         return {"error": "bot not found"}
     row = daily[bot_id].astype(float)
+    # per-calendar-year performance from the full-resolution daily equity
+    yearly = []
+    yr = [str(x)[:4] for x in days]
+    i = 0
+    while i < len(yr):
+        j = i
+        while j + 1 < len(yr) and yr[j + 1] == yr[i]:
+            j += 1
+        start_val = row[i - 1] if i > 0 else row[i]
+        if start_val and start_val == start_val:
+            yearly.append({"year": yr[i],
+                           "ret_pct": round((row[j] / start_val - 1.0) * 100, 2),
+                           "end_usd": round(float(row[j]), 2)})
+        i = j + 1
     step = max(1, len(days) // 400)
     sel = list(range(0, len(days), step))
     if sel[-1] != len(days) - 1:
@@ -533,6 +708,7 @@ def swarm_bot_payload(run_id: str, bot_id: int) -> dict:
         "days": [days[i] for i in sel],
         "equity": [round(row[i], 2) for i in sel],
         "split_day": days[split_day],
+        "yearly": yearly,
     }
 
 
@@ -601,6 +777,9 @@ class Handler(SimpleHTTPRequestHandler):
         if route == "/api/swarm/runs":
             return self._send_json(swarm_runs_payload())
 
+        if route == "/api/swarm/evos":
+            return self._send_json(swarm_evos_payload())
+
         if route == "/api/swarm/run":
             q = parse_qs(parsed.query)
             d = safe_swarm_dir((q.get("id") or [""])[0])
@@ -612,6 +791,11 @@ class Handler(SimpleHTTPRequestHandler):
                     {"error": "recap not ready",
                      "progress": _read_json(d / "progress.json")}, 202)
             return self._send_json(recap)
+
+        if route == "/api/swarm/bots":
+            q = parse_qs(parsed.query)
+            payload = swarm_bots_payload((q.get("id") or [""])[0])
+            return self._send_json(payload, 404 if "error" in payload else 200)
 
         if route == "/api/swarm/bot":
             q = parse_qs(parsed.query)
@@ -641,6 +825,15 @@ class Handler(SimpleHTTPRequestHandler):
             path = safe_report_path(route[len("/reports/"):])
             if path is None:
                 return self._send_json({"error": "report not found"}, 404)
+            q = parse_qs(parsed.query)
+            if path.suffix == ".md" and not q.get("raw"):
+                body = render_markdown(path.read_text(), path.stem)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = path.read_bytes()
             ctype = mimetypes.guess_type(path.name)[0] or "text/plain"
             self.send_response(200)

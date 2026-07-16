@@ -29,16 +29,19 @@ from .evolve import _alloc
 ENTRY_Q = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
 STOP_ATR = [2.0, 3.0, 4.0]
 TP_RR = [1.5, 3.0, float("nan")]
-HOLD_BARS = [96, 288]  # 1d, 3d on 15m
+HOLD_DAYS = [1, 3]
+
+TF = {"15m": {"file_arg": "file15", "bars_per_day": 96, "tf_code": 1},
+      "1h": {"file_arg": "file1h", "bars_per_day": 24, "tf_code": 1}}
 
 
-def build_grid(feature_names: list[str]):
+def build_grid(feature_names: list[str], bars_per_day: int):
     fi = feature_names.index("top_ls_pos")
     rows = []
     for q in ENTRY_Q:
         for stop in STOP_ATR:
             for rr in TP_RR:
-                for hold in HOLD_BARS:
+                for hold in [d * bars_per_day for d in HOLD_DAYS]:
                     # SHORT fade: ratio above quantile -> crowded longs -> short
                     rows.append((q, 1, -1, stop, rr, hold, "fade_short"))
                     # LONG mirror: ratio below (1-q) -> crowded shorts -> long
@@ -77,20 +80,21 @@ def build_grid(feature_names: list[str]):
 def cmd_probe(args) -> None:
     from .run import _load, _market
 
-    df15 = _load(args.file15, args.since, args.metrics, args.funding)
-    all_days = df15["dt"].dt.tz_convert(None).dt.floor("D") \
-                         .to_numpy().astype("datetime64[D]")
+    tf = TF[args.tf]
+    df = _load(getattr(args, tf["file_arg"]), args.since, args.metrics, args.funding)
+    all_days = df["dt"].dt.tz_convert(None).dt.floor("D") \
+                       .to_numpy().astype("datetime64[D]")
     all_days = np.unique(all_days)
-    ts = df15["timestamp"].to_numpy(np.int64)
+    ts = df["timestamp"].to_numpy(np.int64)
     split_ts = int(ts[0] + args.split * (ts[-1] - ts[0]))
     split_day = int(np.searchsorted(
         all_days, np.datetime64(pd.Timestamp(split_ts, unit="ms"), "D")))
     qs = np.linspace(0.02, 0.98, 49)
-    mkt, names = _market(df15, 1, 96, split_ts, all_days, qs)
+    mkt, names = _market(df, tf["tf_code"], tf["bars_per_day"], split_ts, all_days, qs)
     if "top_ls_pos" not in names:
         raise SystemExit("top_ls_pos missing — pass --metrics")
 
-    g, labels = build_grid(names)
+    g, labels = build_grid(names, tf["bars_per_day"])
     cfg = {"taker_bps": args.taker_bps, "maker_bps": args.maker_bps,
            "start_capital": args.start_capital, "ruin_frac": args.ruin, "seed": 0}
     out = _alloc(g.n, len(all_days))
@@ -114,20 +118,20 @@ def cmd_probe(args) -> None:
     c = mkt["c"]
     bh_year = {}
     for y in np.unique(years):
-        sel = df15["dt"].dt.year.to_numpy() == y
+        sel = df["dt"].dt.year.to_numpy() == y
         px = c[sel]
         bh_year[int(y)] = px[-1] / px[0] - 1.0
 
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
-    res.to_csv(run_dir / "toptrader_fade_grid.csv", index=False)
+    res.to_csv(run_dir / f"toptrader_fade_grid_{args.tf}.csv", index=False)
 
     # honest selection: best on TRAIN (min activity), judged on TEST
     ok = (res["trades"] >= 30) & res["sharpe_a"].notna()
-    lines = [f"# Top-trader-fade probe — {datetime.now().date()}",
+    lines = [f"# Top-trader-fade probe ({args.tf}) — {datetime.now().date()}",
              "",
              f"Span {all_days[0]} → {all_days[-1]}, split {all_days[split_day]} "
-             f"(train {args.split:.0%}). 15m maker entries (0 fee + "
+             f"(train {args.split:.0%}). {args.tf} maker entries (0 fee + "
              f"{args.maker_bps} bp edge), stops/time exits pay taker "
              f"{args.taker_bps} bps. {len(res)} configs "
              f"({len(res)//2} per family), risk 0.5%/trade.", ""]
@@ -153,6 +157,6 @@ def cmd_probe(args) -> None:
         yr = " | ".join(f"{y}: {yr_cols[y][bi]*100:+.1f}% (B&H {bh_year[y]*100:+.1f}%)"
                         for y in sorted(yr_cols))
         lines += [f"- per-year (train-selected config): {yr}", ""]
-    (run_dir / "toptrader_fade_probe.md").write_text("\n".join(lines))
+    (run_dir / f"toptrader_fade_probe_{args.tf}.md").write_text("\n".join(lines))
     print("\n".join(lines))
-    print(f"\ngrid csv + report -> {run_dir}/toptrader_fade_probe.md")
+    print(f"\ngrid csv + report -> {run_dir}/toptrader_fade_probe_{args.tf}.md")

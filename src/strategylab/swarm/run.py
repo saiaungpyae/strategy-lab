@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +27,16 @@ from . import engine, features, genome, recap
 
 def _load(path: str, since: str | None, metrics: str | None,
           funding: str | None = None) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    # transparent parquet sidecar: ~8x faster to parse than the csv
+    pq = Path(path).with_suffix(".parquet")
+    if pq.exists() and pq.stat().st_mtime >= Path(path).stat().st_mtime:
+        df = pd.read_parquet(pq)
+    else:
+        df = pd.read_csv(path)
+        try:
+            df.to_parquet(pq)
+        except Exception:
+            pass  # cache is best-effort (e.g. read-only data dir)
     df["dt"] = pd.to_datetime(df["datetime"], utc=True, format="mixed")
     if since:
         df = df[df["dt"] >= pd.Timestamp(since, tz="UTC")].reset_index(drop=True)
@@ -55,6 +66,43 @@ def _market(df: pd.DataFrame, tf_code: int, bars_per_day: int, split_ts: int,
         "day_pos": np.searchsorted(days_arr, bar_days).astype(np.int64),
         "seg_b": seg_b, "F": F, "Q": Q, "qs": qs,
     }, names
+
+
+# Bots per parallel chunk. Fixed so chunking (and thus the control-bot RNG
+# stream) is a function of the population alone — never of --jobs or cores.
+# 128 keeps ~40 tasks in flight for a 5k swarm: fine-grained enough to load-
+# balance across many cores, coarse enough that per-chunk setup is noise.
+CHUNK = 128
+
+
+def _pool(n_jobs: int):
+    """Thread pool when the numba kernel is active (it drops the GIL, so
+    threads parallelize with zero copy); process pool for the numpy fallback."""
+    if engine.numba is not None:
+        return ThreadPoolExecutor(max_workers=n_jobs)
+    return ProcessPoolExecutor(max_workers=n_jobs)
+
+
+def _alloc_out(n: int, n_days: int) -> dict:
+    out = {"daily": np.full((n, n_days), np.nan, dtype=np.float32),
+           "final_eq": np.zeros(n), "dead": np.zeros(n, dtype=bool),
+           "death_day": np.full(n, -1, dtype=np.int64)}
+    for k in ("trades_a", "trades_b", "wins_a", "wins_b", "expo_a", "expo_b",
+              "bars_a", "bars_b"):
+        out[k] = np.zeros(n, dtype=np.int64)
+    return out
+
+
+def _sim_chunk(mkt, g_sub, cfg, salt, n_days):
+    """Worker: simulate one bot chunk; returns a compact out (rows = chunk order)."""
+    out = _alloc_out(g_sub.n, n_days)
+    engine.run_cohort(mkt, g_sub, np.arange(g_sub.n), cfg, out, rng_salt=salt)
+    return out
+
+
+def _merge_out(out, ret, pos):
+    for k in out:
+        out[k][pos] = ret[k]
 
 
 def cmd_run(args) -> None:
@@ -106,23 +154,36 @@ def cmd_run(args) -> None:
     gdf.to_csv(run_dir / "genomes.csv", index=False)
 
     n = args.bots
-    out = {"daily": np.full((n, len(all_days)), np.nan, dtype=np.float32),
-           "final_eq": np.zeros(n), "dead": np.zeros(n, dtype=bool),
-           "death_day": np.full(n, -1, dtype=np.int64)}
-    for k in ("trades_a", "trades_b", "wins_a", "wins_b", "expo_a", "expo_b",
-              "bars_a", "bars_b"):
-        out[k] = np.zeros(n, dtype=np.int64)
+    out = _alloc_out(n, len(all_days))
 
     idx5, idx15 = np.flatnonzero(g.tf == 0), np.flatnonzero(g.tf == 1)
     print(f"[{run_id}] {n} bots ({len(idx5)} on 5m, {len(idx15)} on 15m, "
           f"{int(g.is_control.sum())} control) | {cfg['span'][0]} → {cfg['span'][1]} "
           f"| split {cfg['split_date']}")
-    engine.run_cohort(mkt5, g, idx5, cfg, out,
-                      progress=lambda f: prog("sim 5m", 0.1 + 0.55 * f))
-    print(f"  5m cohort done ({time.time() - t0:.0f}s)")
-    engine.run_cohort(mkt15, g, idx15, cfg, out,
-                      progress=lambda f: prog("sim 15m", 0.65 + 0.25 * f))
-    print(f"  15m cohort done ({time.time() - t0:.0f}s)")
+
+    # Chunk 0 of each cohort carries salt 0, so a cohort that fits in a single
+    # chunk reproduces the pre-chunking serial run bit-for-bit.
+    tasks = [(mkt, idx[i:i + CHUNK], (i // CHUNK) * 1_000_003)
+             for mkt, idx in ((mkt5, idx5), (mkt15, idx15))
+             for i in range(0, len(idx), CHUNK)]
+    n_jobs = args.jobs if args.jobs > 0 else min(8, os.cpu_count() or 1)
+    n_jobs = max(1, min(n_jobs, len(tasks)))
+    prog("sim", 0.1)
+    if n_jobs > 1:
+        with _pool(n_jobs) as pool:
+            futs = {pool.submit(_sim_chunk, mkt, genome.subset(g, pos), cfg,
+                                salt, len(all_days)): pos
+                    for mkt, pos, salt in tasks}
+            for done, f in enumerate(as_completed(futs), 1):
+                _merge_out(out, f.result(), futs[f])
+                prog("sim", 0.1 + 0.8 * done / len(tasks))
+    else:
+        for done, (mkt, pos, salt) in enumerate(tasks, 1):
+            _merge_out(out, _sim_chunk(mkt, genome.subset(g, pos), cfg, salt,
+                                       len(all_days)), pos)
+            prog("sim", 0.1 + 0.8 * done / len(tasks))
+    print(f"  sim done: {len(tasks)} chunks on {n_jobs} worker(s) "
+          f"({time.time() - t0:.0f}s)")
 
     prog("recap", 0.92)
     sm = recap.seg_metrics(out["daily"], split_day, args.start_capital)
@@ -175,10 +236,12 @@ def cmd_report(args) -> None:
     z = np.load(run_dir / "daily_equity.npz", allow_pickle=False)
     daily, days, split_day = z["daily"], list(z["days"]), int(z["split_day"])
     df5 = _load(cfg["file5"], cfg.get("since"), None)
-    c5 = df5["close"].to_numpy()
-    bnh = float(c5[-1] / c5[engine.WARMUP])
     days_arr = np.array(days, dtype="datetime64[D]")
     bar_days = df5["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]")
+    keep = (bar_days >= days_arr[0]) & (bar_days <= days_arr[-1])  # data may have
+    df5, bar_days = df5[keep].reset_index(drop=True), bar_days[keep]  # grown since the run
+    c5 = df5["close"].to_numpy()
+    bnh = float(c5[-1] / c5[engine.WARMUP])
     day_close = np.full(len(days_arr), np.nan)
     day_close[np.searchsorted(days_arr, bar_days)] = c5
     rec = recap.build_recap(res, gdf, daily, days, split_day, cfg, bnh, day_close)
@@ -192,6 +255,8 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="simulate a swarm")
+    r.add_argument("--jobs", type=int, default=0,
+                   help="worker processes for simulation (0 = auto, 1 = serial)")
     r.add_argument("--file5", default="data/binance_BTC-USDT_5m.csv")
     r.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
     r.add_argument("--metrics", default=None, help="metrics CSV from fetch-metrics")
@@ -237,12 +302,18 @@ def main() -> None:
     e.add_argument("--gens", type=int, default=6, help="fitness windows / generations")
     e.add_argument("--test-frac", type=float, default=0.20,
                    help="final span fraction reserved, untouched by selection")
+    e.add_argument("--fitness", choices=["sharpe", "return"], default="sharpe",
+                   help="'return' = window return with a participation floor")
+    e.add_argument("--min-expo", type=float, default=0.15,
+                   help="exposure floor for --fitness return (fraction of bars)")
     e.add_argument("--seed", type=int, default=42)
     e.add_argument("--since", default=None)
     e.add_argument("--taker-bps", type=float, default=5.0)
     e.add_argument("--maker-bps", type=float, default=1.0)
     e.add_argument("--start-capital", type=float, default=10_000.0)
     e.add_argument("--ruin", type=float, default=0.30)
+    e.add_argument("--jobs", type=int, default=0,
+                   help="worker processes for cohort evaluation (0 = auto, 1 = serial)")
     e.add_argument("--out", default="reports/swarm")
 
     def _evolve(a):
@@ -251,6 +322,8 @@ def main() -> None:
     e.set_defaults(func=_evolve)
 
     pr = sub.add_parser("probe", help="standalone grid test of the top-trader-fade family")
+    pr.add_argument("--tf", choices=["15m", "1h"], default="15m")
+    pr.add_argument("--file1h", default="data/binance_BTC-USDT_1h.csv")
     pr.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
     pr.add_argument("--metrics", default="data/metrics/BTCUSDT_metrics.csv")
     pr.add_argument("--funding", default="data/metrics/BTC-USDT-USDT_funding.csv")
@@ -266,6 +339,9 @@ def main() -> None:
         from . import probe as _pb
         _pb.cmd_probe(a)
     pr.set_defaults(func=_probe)
+
+    from . import mirror as _mirror
+    _mirror.add_parser(sub)
 
     args = ap.parse_args()
     args.func(args)

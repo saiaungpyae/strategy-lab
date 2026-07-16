@@ -91,7 +91,7 @@ def compute_features(df: pd.DataFrame, bars_per_day: int) -> tuple[np.ndarray, l
         a = atr(df)
         feats["atr_pct"] = a / c
         r1 = pd.Series(c).pct_change().to_numpy()
-        feats["vol_regime"] = _roll_std(r1, day // 4) / _roll_std(r1, day * 2)
+        feats["vol_regime"] = _roll_std(r1, max(day // 4, 2)) / _roll_std(r1, day * 2)
         # participation
         feats["vol_z"] = (v - _roll_mean(v, day)) / _roll_std(v, day)
         rng = h - l
