@@ -65,6 +65,8 @@ def _market(df: pd.DataFrame, tf_code: int, bars_per_day: int, split_ts: int,
         "hour": df["dt"].dt.hour.to_numpy(dtype=np.int64),
         "day_pos": np.searchsorted(days_arr, bar_days).astype(np.int64),
         "seg_b": seg_b, "F": F, "Q": Q, "qs": qs,
+        "fund": (df["fund_pay"].to_numpy(dtype=np.float64)
+                 if "fund_pay" in df.columns else np.zeros(len(df))),
     }, names
 
 
@@ -86,7 +88,8 @@ def _pool(n_jobs: int):
 def _alloc_out(n: int, n_days: int) -> dict:
     out = {"daily": np.full((n, n_days), np.nan, dtype=np.float32),
            "final_eq": np.zeros(n), "dead": np.zeros(n, dtype=bool),
-           "death_day": np.full(n, -1, dtype=np.int64)}
+           "death_day": np.full(n, -1, dtype=np.int64),
+           "fees": np.zeros(n), "fund_paid": np.zeros(n)}
     for k in ("trades_a", "trades_b", "wins_a", "wins_b", "expo_a", "expo_b",
               "bars_a", "bars_b"):
         out[k] = np.zeros(n, dtype=np.int64)
@@ -197,6 +200,8 @@ def cmd_run(args) -> None:
         "sharpe_a": sm["sharpe_a"], "sharpe_b": sm["sharpe_b"],
         "maxdd_b": sm["maxdd_b"], "maxdd_all": sm["maxdd_all"],
         "final_mult": sm["final_mult"],
+        "fees": np.round(out["fees"], 2),
+        "fund_paid": np.round(out["fund_paid"], 2),
         "dead": out["dead"], "death_day": out["death_day"],
     })
     res.to_csv(run_dir / "results.csv", index=False)
@@ -302,12 +307,20 @@ def main() -> None:
     e.add_argument("--gens", type=int, default=6, help="fitness windows / generations")
     e.add_argument("--test-frac", type=float, default=0.20,
                    help="final span fraction reserved, untouched by selection")
-    e.add_argument("--fitness", choices=["sharpe", "return"], default="sharpe",
-                   help="'return' = window return with a participation floor")
+    e.add_argument("--fitness", choices=["sharpe", "return", "balanced"],
+                   default="sharpe",
+                   help="'return' = window return with a participation floor; "
+                        "'balanced' = mean of up-day and down-day Sharpe")
+    e.add_argument("--hof-metric", choices=["fitness", "sharpe"],
+                   default="fitness",
+                   help="'sharpe' admits HOF by window Sharpe even when "
+                        "breeding on another fitness (hybrid mode)")
     e.add_argument("--min-expo", type=float, default=0.15,
                    help="exposure floor for --fitness return (fraction of bars)")
+    e.add_argument("--hof-per-gen", type=int, default=0,
+                   help="hall-of-fame slots per generation (0 = auto: max(10, bots/1000))")
     e.add_argument("--seed", type=int, default=42)
-    e.add_argument("--since", default=None)
+    e.add_argument("--since", default="2021-01-01")
     e.add_argument("--taker-bps", type=float, default=5.0)
     e.add_argument("--maker-bps", type=float, default=1.0)
     e.add_argument("--start-capital", type=float, default=10_000.0)
@@ -321,7 +334,9 @@ def main() -> None:
         _ev.cmd_evolve(a)
     e.set_defaults(func=_evolve)
 
-    pr = sub.add_parser("probe", help="standalone grid test of the top-trader-fade family")
+    pr = sub.add_parser("probe", help="standalone grid test of a positioning-fade family")
+    pr.add_argument("--feature", default="top_ls_pos",
+                    help="feature to fade (e.g. global_ls, top_ls_pos)")
     pr.add_argument("--tf", choices=["15m", "1h"], default="15m")
     pr.add_argument("--file1h", default="data/binance_BTC-USDT_1h.csv")
     pr.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")

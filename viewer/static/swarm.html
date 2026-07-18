@@ -70,6 +70,9 @@
   .empty { text-align: center; color: var(--muted); padding: 80px 0; }
   .scroll { overflow-x: auto; }
   .muted { color: var(--muted); }
+  .pbar { height: 10px; background: var(--panel2); border: 1px solid var(--border);
+          border-radius: 6px; overflow: hidden; }
+  .pbar i { display: block; height: 100%; background: var(--accent); transition: width .5s; }
 </style>
 </head>
 <body>
@@ -536,39 +539,102 @@ async function renderBots(el) {
   $('#pgNext').addEventListener('click', () => { botPage++; renderBots(el); });
 }
 
-let EVOS = null;
-async function renderEvolution(el) {
-  if (!EVOS) {
-    el.innerHTML = '<div class="empty">loading evolution runs…</div>';
-    EVOS = (await (await fetch('/api/swarm/evos')).json()).evos;
-  }
-  if (!EVOS.length) {
-    el.innerHTML = '<div class="empty">No evolution runs yet — run <code>sl-swarm evolve</code>.</div>';
+let EVOS = [], evoRunning = false, evoTimer = null;
+
+async function fetchEvos() {
+  const j = await (await fetch('/api/swarm/evos')).json();
+  EVOS = j.evos || []; evoRunning = !!j.running;
+}
+
+function evoChart(parent, gs) {
+  if (gs.length < 2) {
+    parent.innerHTML = '<div class="muted" style="text-align:center;padding:40px 0">chart appears after the second generation…</div>';
     return;
   }
-  const e = EVOS.find(x => x.run_id === window.__evoSel) || EVOS[0];
+  parent.innerHTML = '';
+  lines(parent, gs.map(x => x.window[1]),
+    [{ v: gs.map(x => x.evolved.median_sharpe), c: C.up, wd: 2 },
+     { v: gs.map(x => x.placebo.median_sharpe), c: C.muted, wd: 2 },
+     { v: gs.map(x => x.evolved.p90_sharpe), c: C.up, dash: [4, 3], wd: 1 },
+     { v: gs.map(x => x.placebo.p90_sharpe), c: C.muted, dash: [4, 3], wd: 1 }],
+    240, x => fmt(x, 1));
+}
+const evoLegend = `<div class="legend" style="margin-top:6px">
+  <span><i style="background:${C.up}"></i>evolved median</span>
+  <span><i style="background:${C.muted}"></i>placebo median</span>
+  <span class="muted">dashed = p90</span></div>`;
+
+function genTable(gs) {
+  if (!gs.length) return '<div class="muted" style="padding:14px">waiting for the first generation…</div>';
+  return `<table><thead><tr><th>gen</th><th class="l">fitness window</th>
+    <th>evolved S</th><th>p90</th><th>dead</th><th>trades</th>
+    <th class="muted">placebo S</th><th class="muted">p90</th></tr></thead><tbody>
+    ${gs.map(r => `<tr><td>${r.gen}</td>
+      <td class="l muted">${r.window[0]} → ${r.window[1]}</td>
+      <td class="${r.evolved.median_sharpe >= 0 ? 'pos' : 'neg'}"><b>${fmt(r.evolved.median_sharpe)}</b></td>
+      <td>${fmt(r.evolved.p90_sharpe)}</td>
+      <td>${fmt(r.evolved.dead_pct, 1)}%</td><td>${r.evolved.median_trades}</td>
+      <td class="muted">${fmt(r.placebo.median_sharpe)}</td>
+      <td class="muted">${fmt(r.placebo.p90_sharpe)}</td></tr>`).join('')}
+    </tbody></table>`;
+}
+
+function evoLiveBody(e) {
+  const pct = Math.round((e.frac || 0) * 100);
+  const stage = e.stage === 'gen' ? `generation ${(e.gen ?? 0) + 1} / ${e.gens}`
+    : e.stage === 'final_test' ? 'final exam on reserved test span'
+    : (e.stage || 'starting…');
+  const stalled = !evoRunning && (e.age_s || 0) > 120;
+  const gs = e.gen_stats || [];
+  return `<div class="grid">
+    ${stalled ? `<div class="banner" style="grid-column:span 12">⚠ No progress update for
+      ${Math.round(e.age_s)}s and no evolve process is attached to this server — the run may
+      have died. Check <code>reports/swarm/last_evolve.log</code>.</div>` : ''}
+    <div class="card" style="grid-column:span 12">
+      <h3>Live · ${e.run_id}</h3>
+      <div class="sub">${e.bots} bots/lineage · ${e.gens} walk-forward windows · ${e.fitness} fitness
+        · seed ${e.seed}${e.span ? ` · span ${e.span[0]} → ${e.span[1]}` : ''}
+        · test reserved from ${(e.test_start || '').slice(0, 10) || '…'}
+        ${e.maker_only ? ' · maker-only' : ''}</div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <span style="min-width:180px">${stage}</span>
+        <div class="pbar" style="flex:1"><i style="width:${pct}%"></i></div>
+        <span class="muted" style="min-width:90px;text-align:right">${pct}% · ${Math.round(e.elapsed_s || 0)}s</span>
+      </div>
+    </div>
+    <div class="card" style="grid-column:span 7">
+      <h3>Selection vs placebo — live</h3>
+      <div class="sub">median fitness-window Sharpe per generation, updating as each window
+        finishes. Every generation is scored on data that played no role in creating it.</div>
+      <div id="evoChart"></div>${evoLegend}
+    </div>
+    <div class="card scroll" style="grid-column:span 5;padding:0">${genTable(gs)}</div>
+  </div>`;
+}
+
+function evoDoneBody(e) {
   const ft = e.final_test || {};
   const groups = ['evolved', 'placebo', 'fresh_random', 'hall_of_fame'];
   const g = k => ft[k] || {};
   const v = (x, d=2) => x == null ? '—' : (+x).toFixed(d);
-  el.innerHTML = `
-    <div class="grid">
+  return `<div class="grid">
       <div class="card" style="grid-column:span 12; display:flex; gap:16px; align-items:center; flex-wrap:wrap">
-        <select id="evoSel">${EVOS.map(x =>
-          `<option value="${x.run_id}" ${x.run_id === e.run_id ? 'selected' : ''}>${x.run_id} · ${x.fitness || 'sharpe'} fitness</option>`).join('')}</select>
         <span class="muted">${e.bots} bots/lineage · ${e.gens} walk-forward windows · seed ${e.seed}
-          · costs ${e.maker_bps}bp maker / ${e.taker_bps}bp taker · test reserved from ${(e.test_start || '').slice(0, 10)}</span>
-        <span class="chip">skill vs placebo: ${v(e.skill_vs_placebo)}</span>
+          · ${e.fitness || 'sharpe'} fitness · costs ${e.maker_bps}bp maker / ${e.taker_bps}bp taker
+          · test reserved from ${(e.test_start || '').slice(0, 10)} · ${e.elapsed_s}s
+          ${e.funding ? ' · funding charged' : ''}</span>
+        <span class="chip">skill vs placebo: ${v(e.skill_vs_placebo)}${
+          e.skill_ci95 ? ` <span class="muted">[${v(e.skill_ci95[0])} … ${v(e.skill_ci95[1])}]</span>` : ''}</span>
+        ${e.hof_check ? `<span class="muted" title="correlation of each score with test Sharpe across HOF bots — born-window fitness is an in-sample order statistic; consistency on later windows is the honest ranking signal">
+          HOF predictiveness — born fitness ${v(e.hof_check.corr_born_fitness_vs_test)}
+          vs OOS consistency ${v(e.hof_check.corr_oos_consistency_vs_test)}</span>` : ''}
       </div>
       <div class="card" style="grid-column:span 7">
         <h3>Generation-by-generation divergence</h3>
         <div class="sub">median fitness-window Sharpe per generation — selection (teal) vs
           random-selection placebo (gray). Each generation is scored on a window that played
           no role in creating it.</div>
-        <div id="evoChart"></div>
-        <div class="legend" style="margin-top:6px">
-          <span><i style="background:${C.up}"></i>evolved</span>
-          <span><i style="background:${C.muted}"></i>placebo</span></div>
+        <div id="evoChart"></div>${evoLegend}
       </div>
       <div class="card" style="grid-column:span 5">
         <h3>Reserved test span</h3>
@@ -585,22 +651,97 @@ async function renderEvolution(el) {
       </div>
       <div class="card scroll" style="grid-column:span 12; padding:0">
         <table><thead><tr><th>gen</th><th class="l">ideology (hall of fame, by test Sharpe)</th>
-          <th>tf</th><th>session</th><th>risk</th><th>test S</th><th>test trades</th></tr></thead>
+          <th>tf</th><th>session</th><th>risk</th>
+          <th title="mean Sharpe on fitness windows AFTER the bot's birth — its out-of-sample consistency before the test span">OOS S</th>
+          <th>test S</th><th>test trades</th></tr></thead>
           <tbody>${(e.hof_top || []).map(h => `<tr><td>${h.born_gen}</td>
             <td class="l rules" title="${String(h.rules).replaceAll('"', '&quot;')}">${h.rules}</td>
             <td>${h.tf}</td><td>${h.session}</td><td>${v(h.risk_pct, 2)}%</td>
+            <td>${h.oos_sharpe === '' || h.oos_sharpe == null ? '—' : v(h.oos_sharpe)}</td>
             <td class="${+h.test_sharpe >= 0 ? 'pos' : 'neg'}"><b>${v(h.test_sharpe)}</b></td>
             <td>${h.test_trades}</td></tr>`).join('')}</tbody></table>
       </div>
     </div>`;
-  const gs = e.gen_stats || [];
-  lines($('#evoChart'), gs.map(x => x.window[1]),
-    [{ v: gs.map(x => x.evolved.median_sharpe), c: C.up },
-     { v: gs.map(x => x.placebo.median_sharpe), c: C.muted }],
-    240, x => fmt(x, 1));
-  $('#evoSel').addEventListener('change', ev => {
-    window.__evoSel = ev.target.value; renderEvolution(el);
+}
+
+function updateEvo() {
+  clearTimeout(evoTimer);
+  const sel = $('#evoSel'), body = $('#evoBody');
+  if (!sel || !body) return;
+  const e = EVOS.find(x => x.run_id === window.__evoSel) || EVOS[0];
+  if (document.activeElement !== sel) {
+    sel.innerHTML = EVOS.map(x =>
+      `<option value="${x.run_id}">${x.run_id}${x.done ? ` · ${x.fitness || 'sharpe'}` :
+        ` · ⏳ ${Math.round((x.frac || 0) * 100)}%`}</option>`).join('')
+      || '<option value="">no evolution runs yet</option>';
+    if (e) sel.value = e.run_id;
+  }
+  $('#evoStatus').textContent = evoRunning ? '⏳ evolution process running' : '';
+  if (!e) {
+    body.innerHTML = `<div class="empty">${evoRunning
+      ? 'Evolution starting — loading data…'
+      : 'No evolution runs yet — hit <b>New evolution…</b> or run <code>sl-swarm evolve</code>.'}</div>`;
+  } else {
+    body.innerHTML = e.done ? evoDoneBody(e) : evoLiveBody(e);
+    evoChart($('#evoChart'), e.gen_stats || []);
+  }
+  if (evoRunning || EVOS.some(x => !x.done))
+    evoTimer = setTimeout(pollEvo, 2500);
+}
+
+async function pollEvo() {
+  if (TAB !== 'evolution') return;
+  await fetchEvos();
+  updateEvo();
+}
+
+async function renderEvolution(el) {
+  clearTimeout(evoTimer);
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <select id="evoSel"><option>loading…</option></select>
+      <button class="primary" id="evoNewBtn">New evolution…</button>
+      <span id="evoStatus" class="muted"></span>
+    </div>
+    <div class="card" id="evoForm" style="margin-bottom:12px;display:none;gap:10px;align-items:center;flex-wrap:wrap">
+      <label class="muted">bots <input id="evBots" type="number" value="1500" min="100" max="200000" style="width:80px"></label>
+      <label class="muted">gens <input id="evGens" type="number" value="6" min="2" max="30" style="width:60px"></label>
+      <label class="muted">test % <input id="evTest" type="number" value="20" min="5" max="50" style="width:60px"></label>
+      <label class="muted">fitness <select id="evFit"><option value="sharpe">sharpe</option><option value="return">return</option></select></label>
+      <label class="muted">maker bps <input id="evMbps" type="number" value="1" min="0" max="50" step="0.5" style="width:60px"></label>
+      <label class="muted"><input id="evMk" type="checkbox"> maker-only</label>
+      <label class="muted" title="adds OI/long-short/funding features and charges perp funding to open positions"><input id="evDerivs" type="checkbox"> OI + funding</label>
+      <label class="muted">seed <input id="evSeed" type="number" value="42" style="width:70px"></label>
+      <label class="muted">since <input id="evSince" value="2021-01-01" placeholder="2021-01-01" style="width:100px"></label>
+      <button class="primary" id="evoGo">Start evolution</button>
+      <span class="muted">runs as its own process · artifacts in reports/swarm/evo-*/</span>
+    </div>
+    <div id="evoBody"><div class="empty">loading evolution runs…</div></div>`;
+  $('#evoNewBtn').addEventListener('click', () => {
+    const f = $('#evoForm');
+    f.style.display = f.style.display === 'none' ? 'flex' : 'none';
   });
+  $('#evoGo').addEventListener('click', async () => {
+    const body = { bots: +$('#evBots').value, gens: +$('#evGens').value,
+                   test_frac: +$('#evTest').value / 100, fitness: $('#evFit').value,
+                   maker_bps: +$('#evMbps').value, maker_only: $('#evMk').checked,
+                   derivs: $('#evDerivs').checked,
+                   seed: +$('#evSeed').value, since: $('#evSince').value.trim() };
+    const r = await fetch('/api/swarm/evolve/start', { method: 'POST', body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!j.started) { alert(j.error || 'failed'); return; }
+    window.__evoSel = null;
+    $('#evoForm').style.display = 'none';
+    $('#evoStatus').textContent = '⏳ starting…';
+    evoRunning = true;
+    clearTimeout(evoTimer);
+    evoTimer = setTimeout(pollEvo, 1200);
+  });
+  $('#evoSel').addEventListener('change', ev => {
+    window.__evoSel = ev.target.value; pollEvo();
+  });
+  await fetchEvos();
+  updateEvo();
 }
 
 // ------------------------------------------------------------- data flow --

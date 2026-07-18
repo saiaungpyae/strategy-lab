@@ -217,8 +217,23 @@ def fetch_funding(symbol: str, since: str, out_dir: Path) -> Path:
 
 
 def merge_funding(df: pd.DataFrame, funding_csv: Path) -> pd.DataFrame:
-    """Backward as-of merge; each candle sees the last settled funding rate."""
+    """Backward as-of merge; each candle sees the last settled funding rate.
+
+    Also writes `fund_pay`: the settled rate on the first bar at/after each
+    settlement timestamp (0 elsewhere). The engine charges that rate to any
+    position open on that bar — longs pay when funding is positive, shorts
+    receive, and vice versa."""
     f = pd.read_csv(funding_csv).sort_values("timestamp")
     df = df.sort_values("timestamp")
-    return pd.merge_asof(df, f, on="timestamp", direction="backward",
-                         tolerance=9 * 3600 * 1000)
+    out = pd.merge_asof(df, f, on="timestamp", direction="backward",
+                        tolerance=9 * 3600 * 1000)
+    ts = out["timestamp"].to_numpy(np.int64)
+    fts = f["timestamp"].to_numpy(np.int64)
+    rates = f["funding"].to_numpy(np.float64)
+    keep = fts >= ts[0]
+    pos = np.searchsorted(ts, fts[keep])
+    pay = np.zeros(len(out))
+    ok = pos < len(out)
+    pay[pos[ok]] = rates[keep][ok]
+    out["fund_pay"] = pay
+    return out

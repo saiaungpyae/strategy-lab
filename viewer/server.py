@@ -8,7 +8,7 @@ No external services, no TradingView account.
 
 Run:
     ./.venv/bin/python viewer/server.py
-then open http://127.0.0.1:8000
+then open http://127.0.0.1:8020
 
 Endpoints:
     /                       -> the chart page
@@ -37,6 +37,7 @@ from zoneinfo import ZoneInfo
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE.parent / "data"
 STATIC_DIR = HERE / "static"
+DIST_DIR = STATIC_DIR / "dist"  # built React app (viewer/frontend → npm run build)
 REPORTS_DIR = HERE.parent / "reports"
 
 
@@ -54,7 +55,7 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(HERE.parent / ".env")
 HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", "8020"))
 
 # Reuse the exact indicator + signal code the backtests use, so overlaid
 # samples match what the backtests in strategylab.backtest actually traded.
@@ -134,11 +135,12 @@ def list_datasets() -> list[dict]:
 
 
 def safe_data_path(filename: str) -> Path | None:
-    """Resolve a requested filename strictly inside DATA_DIR (no traversal)."""
+    """Resolve a requested filename strictly inside DATA_DIR (no traversal).
+    Nested paths are allowed (pinned snapshots live in data/snapshots/…)."""
     if not filename:
         return None
     candidate = (DATA_DIR / filename).resolve()
-    if candidate.parent != DATA_DIR.resolve() or not candidate.is_file():
+    if not candidate.is_relative_to(DATA_DIR.resolve()) or not candidate.is_file():
         return None
     return candidate
 
@@ -572,6 +574,7 @@ def safe_report_path(filename: str) -> Path | None:
 
 SWARM_DIR = REPORTS_DIR / "swarm"
 _swarm_proc = None
+_evolve_proc = None
 _swarm_lock = threading.Lock()
 
 
@@ -624,22 +627,244 @@ def _swarm_tables(run_dir: str, mtime: float):
 
 
 def swarm_evos_payload() -> dict:
-    """Evolution runs: evolution.json + top hall-of-fame rows per run."""
+    """Evolution runs: finished ones (evolution.json + top hall-of-fame rows)
+    and in-flight ones (live progress.json written after every sim chunk)."""
     evos = []
     if SWARM_DIR.is_dir():
         for d in sorted(SWARM_DIR.iterdir(), reverse=True):
-            if not d.is_dir() or not (d / "evolution.json").is_file():
+            if not d.is_dir():
                 continue
-            e = _read_json(d / "evolution.json") or {}
-            hof_csv = d / "hof_test.csv"
-            if hof_csv.is_file():
-                import csv
-                with hof_csv.open() as fh:
-                    e["hof_top"] = list(csv.DictReader(fh))[:10]
-            else:
-                e["hof_top"] = []
-            evos.append(e)
-    return {"evos": evos}
+            if (d / "evolution.json").is_file():
+                e = _read_json(d / "evolution.json") or {}
+                e["done"] = True
+                hof_csv = d / "hof_test.csv"
+                if hof_csv.is_file():
+                    import csv
+                    with hof_csv.open() as fh:
+                        e["hof_top"] = list(csv.DictReader(fh))[:10]
+                else:
+                    e["hof_top"] = []
+                evos.append(e)
+            elif d.name.startswith("evo-") and (d / "progress.json").is_file():
+                p = _read_json(d / "progress.json") or {}
+                p.setdefault("run_id", d.name)
+                p["done"] = False
+                # writer stamps it after every chunk; a stale stamp means the
+                # process died mid-run
+                p["age_s"] = round(time.time() - (d / "progress.json").stat().st_mtime, 1)
+                evos.append(p)
+    running = _evolve_proc is not None and _evolve_proc.poll() is None
+    return {"evos": evos, "running": running}
+
+
+@lru_cache(maxsize=4)
+def _evo_history(run_dir: str, mtime: float):
+    return _read_json(Path(run_dir) / "hof_history.json")
+
+
+def _hof_csv_rows(d: Path) -> list[dict]:
+    """Legacy fallback: hall-of-fame rows from hof_test.csv with numeric
+    fields coerced (runs made before hof_history.json existed)."""
+    import csv
+    rows = []
+    with (d / "hof_test.csv").open() as fh:
+        for r in csv.DictReader(fh):
+            for k in ("test_sharpe", "risk_pct"):
+                try:
+                    r[k] = float(r[k])
+                except (KeyError, ValueError):
+                    r[k] = None
+            for k in ("bot_id", "test_trades", "born_gen"):
+                try:
+                    r[k] = int(r[k])
+                except (KeyError, ValueError):
+                    r[k] = None
+            rows.append(r)
+    rows.sort(key=lambda r: (r["test_sharpe"] is None, -(r["test_sharpe"] or 0.0)))
+    return rows
+
+
+def evo_bots_payload(run_id: str) -> dict:
+    """All hall-of-fame bots of one evolution run, ranked by final holdings
+    (fallback runs without history rank by test Sharpe). The viewer sorts and
+    paginates client-side — the whole hall of fame is small."""
+    d = safe_swarm_dir(run_id)
+    if d is None or not (d / "evolution.json").is_file():
+        return {"error": "run not found"}
+    e = _read_json(d / "evolution.json") or {}
+    meta = {"run_id": run_id, "fitness": e.get("fitness"),
+            "gens": e.get("gens"), "test_start": e.get("test_start"),
+            "seed": e.get("seed"), "bots_per_lineage": e.get("bots")}
+    hp = d / "hof_history.json"
+    if hp.is_file():
+        h = _evo_history(str(d), hp.stat().st_mtime) or {}
+        start_cap = float(h.get("start_capital", 10_000.0))
+        bots = []
+        for r in h.get("bots", []):
+            b = {k: r.get(k) for k in
+                 ("bot_id", "born_gen", "rules", "tf", "session", "dir_bias",
+                  "risk_pct", "test_sharpe", "test_trades")}
+            b["test_ret_pct"] = (r.get("test") or {}).get("ret_pct")
+            b["gen_sharpes"] = [p.get("sharpe") for p in r.get("gen_perf", [])]
+            # $start_cap compounded through every window, then the test span
+            # (windows are evaluated independently; %-risk sizing makes the
+            # multipliers chainable)
+            m = 1.0
+            for w in r.get("eq") or []:
+                if w:
+                    m *= w[-1]
+            if r.get("eq_test"):
+                m *= r["eq_test"][-1]
+            b["final_usd"] = round(start_cap * m, 2)
+            bots.append(b)
+        bots.sort(key=lambda b: (b["final_usd"] is None,
+                                 -(b["final_usd"] or 0.0)))
+        return {**meta, "has_history": True, "n_hof": len(bots),
+                "start_capital": start_cap,
+                "windows": [w.get("span") for w in h.get("windows", [])],
+                "bots": bots}
+    if (d / "hof_test.csv").is_file():
+        rows = _hof_csv_rows(d)
+        return {**meta, "has_history": False, "n_hof": len(rows),
+                "windows": [], "bots": rows}
+    return {**meta, "has_history": False, "n_hof": 0, "windows": [], "bots": []}
+
+
+def evo_bot_payload(run_id: str, bot_id: int) -> dict:
+    """One hall-of-fame bot: genome plus its per-generation record."""
+    d = safe_swarm_dir(run_id)
+    if d is None or not (d / "evolution.json").is_file():
+        return {"error": "run not found"}
+    hp = d / "hof_history.json"
+    if hp.is_file():
+        h = _evo_history(str(d), hp.stat().st_mtime) or {}
+        rec = next((b for b in h.get("bots", [])
+                    if b.get("bot_id") == bot_id), None)
+        if rec is None:
+            return {"error": "bot not found"}
+        return {"run_id": run_id, "has_history": True,
+                "start_capital": float(h.get("start_capital", 10_000.0)),
+                "windows": h.get("windows", []), "test": h.get("test", {}),
+                "bot": rec}
+    if (d / "hof_test.csv").is_file():
+        rec = next((r for r in _hof_csv_rows(d) if r["bot_id"] == bot_id), None)
+        if rec is None:
+            return {"error": "bot not found"}
+        return {"run_id": run_id, "has_history": False, "windows": [],
+                "test": {}, "bot": rec}
+    return {"error": "bot not found"}
+
+
+# ----------------------------------------------------------------------------
+# Bot trade replay — re-simulate one hall-of-fame genome and return its full
+# trade log so the chart page can overlay every position on the candles.
+# ----------------------------------------------------------------------------
+def _resolve_repo_path(p: str | None) -> Path | None:
+    if not p:
+        return None
+    path = Path(p)
+    if not path.is_absolute():
+        path = HERE.parent / path
+    return path if path.is_file() else None
+
+
+@lru_cache(maxsize=2)
+def _evo_market(file5: str, file15: str, since: str, metrics: str, funding: str):
+    """Rebuild both timeframe market dicts exactly as the evolution did.
+    Heavy (feature pass over the whole tape) but keyed only by the input
+    files, so every bot of every run on the same data shares one build."""
+    from strategylab.swarm.run import _load, _market
+    df5 = _load(file5, since or None, metrics or None, funding or None)
+    df15 = _load(file15, since or None, metrics or None, funding or None)
+    ts5 = df5["timestamp"].to_numpy(np.int64)
+    ts15 = df15["timestamp"].to_numpy(np.int64)
+    all_days = np.union1d(
+        df5["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]"),
+        df15["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]"))
+    qs = np.linspace(0.02, 0.98, 49)
+    ts_max = int(ts5[-1])
+    mkt5, names = _market(df5, 0, 288, ts_max + 1, all_days, qs)
+    mkt15, _ = _market(df15, 1, 96, ts_max + 1, all_days, qs)
+    return mkt5, ts5, mkt15, ts15, names, qs
+
+
+_trades_cache: dict[tuple, dict] = {}
+
+
+def evo_bot_trades_payload(run_id: str, bot_id: int) -> dict:
+    """Full trade log of one HOF bot, re-simulated over the run's fitness
+    windows + reserved test span. Cached per (run, bot) — the history file
+    is immutable once the run finishes."""
+    key = (run_id, bot_id)
+    if key in _trades_cache:
+        return _trades_cache[key]
+    d = safe_swarm_dir(run_id)
+    if d is None or not (d / "evolution.json").is_file():
+        return {"error": "run not found"}
+    if not (d / "hof_history.json").is_file():
+        return {"error": "this run predates trade replay (no hof_history.json) "
+                         "— re-run an evolution"}
+    e = _read_json(d / "evolution.json") or {}
+    h = _evo_history(str(d), (d / "hof_history.json").stat().st_mtime) or {}
+    rec = next((b for b in h.get("bots", []) if b.get("bot_id") == bot_id), None)
+    if rec is None:
+        return {"error": "bot not found"}
+
+    paths = [x.get("path") for x in e.get("data") or []]
+    if len(paths) != 2:
+        return {"error": "run has no pinned data provenance"}
+    f5, f15 = _resolve_repo_path(paths[0]), _resolve_repo_path(paths[1])
+    if f5 is None or f15 is None:
+        return {"error": f"run data files are gone ({paths[0]}, {paths[1]})"}
+    metrics = _resolve_repo_path(e.get("metrics"))
+    funding = _resolve_repo_path(e.get("funding"))
+
+    from strategylab.swarm import trace
+    mkt5, ts5, mkt15, ts15, names, qs = _evo_market(
+        str(f5), str(f15), e.get("since") or "",
+        str(metrics) if metrics else "", str(funding) if funding else "")
+    mkt, ts, tf_path = (mkt5, ts5, f5) if rec.get("tf") == "5m" else (mkt15, ts15, f15)
+
+    # reconstruct the exact window bounds: ts_min is recomputable from the
+    # pinned data + since; test_t0 round-trips through test_start at ms
+    # precision; ts_max is inverted from the test_frac split formula
+    ts_min = int(ts5[0])
+    test_t0 = int(np.datetime64(e["test_start"]).astype("datetime64[ms]").astype(np.int64))
+    test_frac = float(e.get("test_frac") or 0.2)
+    ts_max = ts_min + round((test_t0 - ts_min) / max(1.0 - test_frac, 1e-9))
+    gens = int(e.get("gens") or 0)
+    bounds = np.linspace(ts_min, test_t0, gens + 1).astype(np.int64)
+    segments = [(f"g{g}", int(bounds[g]), int(bounds[g + 1])) for g in range(gens)]
+    segments.append(("test", test_t0, ts_max + 1))
+
+    cfg = {"taker_bps": float(e.get("taker_bps") or 5.0),
+           "maker_bps": float(e.get("maker_bps") or 1.0),
+           "start_capital": float(h.get("start_capital", 10_000.0)),
+           "ruin_frac": 0.30}
+    try:
+        trades = trace.trace_bot(rec, names, mkt, ts, segments, qs, cfg)
+    except ValueError as ex:
+        return {"error": str(ex)}
+
+    windows = [{"seg": f"g{w.get('gen')}", "span": w.get("span")}
+               for w in h.get("windows", [])]
+    windows.append({"seg": "test",
+                    "span": [(e.get("test_start") or "")[:10],
+                             str(np.datetime64(ts_max, "ms").astype("datetime64[D]"))]})
+    payload = {
+        "run_id": run_id, "bot_id": bot_id, "tf": rec.get("tf"),
+        "rules": rec.get("rules"), "born_gen": rec.get("born_gen"),
+        "file": str(tf_path.relative_to(DATA_DIR.resolve()))
+                if tf_path.resolve().is_relative_to(DATA_DIR.resolve()) else None,
+        "windows": windows, "test_start": e.get("test_start"),
+        "n_trades": len(trades), "trades": trades,
+        "note": "re-simulated from the stored genome (values are rounded in "
+                "the artifact), so a marginal fill can differ from the run",
+    }
+    if len(_trades_cache) > 64:
+        _trades_cache.clear()
+    _trades_cache[key] = payload
+    return payload
 
 
 def swarm_bots_payload(run_id: str) -> dict:
@@ -746,6 +971,60 @@ def start_swarm(params: dict) -> dict:
         return {"started": True, "cmd": " ".join(cmd)}
 
 
+def start_evolve(params: dict) -> dict:
+    global _evolve_proc
+    import subprocess
+    with _swarm_lock:
+        if _evolve_proc is not None and _evolve_proc.poll() is None:
+            return {"started": False, "error": "an evolution is already running"}
+        try:
+            bots = int(params.get("bots", 1500))
+            gens = max(2, min(int(params.get("gens", 6)), 30))
+            test_frac = min(max(float(params.get("test_frac", 0.2)), 0.05), 0.5)
+            seed = int(params.get("seed", 42))
+            min_expo = min(max(float(params.get("min_expo", 0.15)), 0.0), 0.9)
+            maker_bps = min(max(float(params.get("maker_bps", 1.0)), 0.0), 50.0)
+            taker_bps = min(max(float(params.get("taker_bps", 5.0)), 0.0), 50.0)
+        except (TypeError, ValueError):
+            return {"started": False, "error": "bad parameters"}
+        if not 100 <= bots <= 200_000:
+            # explicit error, never a silent clamp — a clamped run once cost a
+            # user a 150k experiment that quietly ran at 20k
+            return {"started": False,
+                    "error": f"bots must be between 100 and 200000 (got {bots})"}
+        fitness = str(params.get("fitness") or "sharpe")
+        if fitness not in ("sharpe", "return"):
+            return {"started": False, "error": "bad fitness"}
+        since = str(params.get("since") or "")
+        if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+            return {"started": False, "error": "bad since date"}
+        cmd = [sys.executable, "-m", "strategylab.swarm.run", "evolve",
+               "--bots", str(bots), "--gens", str(gens),
+               "--test-frac", str(test_frac), "--fitness", fitness,
+               "--min-expo", str(min_expo), "--seed", str(seed),
+               "--maker-bps", str(maker_bps), "--taker-bps", str(taker_bps)]
+        if since:
+            cmd += ["--since", since]
+        if params.get("maker_only"):
+            cmd += ["--maker-only"]
+        if params.get("derivs"):
+            # derivatives features (OI, long/short ratios) + funding, which is
+            # both a perception feature and a per-settlement holding cost
+            metrics = DATA_DIR / "metrics" / "BTCUSDT_metrics.csv"
+            funding = DATA_DIR / "metrics" / "BTC-USDT-USDT_funding.csv"
+            missing = [p.name for p in (metrics, funding) if not p.is_file()]
+            if missing:
+                return {"started": False, "error":
+                        f"missing {', '.join(missing)} — run sl-swarm "
+                        "fetch-metrics / fetch-funding first"}
+            cmd += ["--metrics", str(metrics), "--funding", str(funding)]
+        SWARM_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(SWARM_DIR / "last_evolve.log", "w")
+        _evolve_proc = subprocess.Popen(cmd, cwd=str(HERE.parent),
+                                        stdout=log, stderr=subprocess.STDOUT)
+        return {"started": True, "bots": bots, "cmd": " ".join(cmd)}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
@@ -762,16 +1041,17 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
 
-        if route == "/" or route == "/dashboard.html":
-            self.path = "/dashboard.html"
-            return super().do_GET()
-
-        if route == "/chart" or route == "/index.html":
-            self.path = "/index.html"
-            return super().do_GET()
-
-        if route == "/swarm" or route == "/swarm.html":
-            self.path = "/swarm.html"
+        if route in ("/", "/chart", "/swarm", "/evolution",
+                     "/evolution/bots", "/evolution/bot"):
+            # Serve the built React app (viewer/frontend) when present; fall
+            # back to the legacy single-file pages so the viewer still works
+            # without an `npm run build` (there, evolution is a tab on the
+            # swarm page and has no bot pages).
+            if (DIST_DIR / "index.html").is_file():
+                self.path = "/dist/index.html"
+            else:
+                self.path = {"/": "/dashboard.html",
+                             "/chart": "/index.html"}.get(route, "/swarm.html")
             return super().do_GET()
 
         if route == "/api/swarm/runs":
@@ -779,6 +1059,29 @@ class Handler(SimpleHTTPRequestHandler):
 
         if route == "/api/swarm/evos":
             return self._send_json(swarm_evos_payload())
+
+        if route == "/api/swarm/evo/bots":
+            q = parse_qs(parsed.query)
+            p = evo_bots_payload((q.get("id") or [""])[0])
+            return self._send_json(p, 404 if "error" in p else 200)
+
+        if route == "/api/swarm/evo/bot":
+            q = parse_qs(parsed.query)
+            try:
+                bot_id = int((q.get("bot") or [""])[0])
+            except ValueError:
+                return self._send_json({"error": "bad bot id"}, 400)
+            p = evo_bot_payload((q.get("id") or [""])[0], bot_id)
+            return self._send_json(p, 404 if "error" in p else 200)
+
+        if route == "/api/swarm/evo/trades":
+            q = parse_qs(parsed.query)
+            try:
+                bot_id = int((q.get("bot") or [""])[0])
+            except ValueError:
+                return self._send_json({"error": "bad bot id"}, 400)
+            p = evo_bot_trades_payload((q.get("id") or [""])[0], bot_id)
+            return self._send_json(p, 404 if "error" in p else 200)
 
         if route == "/api/swarm/run":
             q = parse_qs(parsed.query)
@@ -897,6 +1200,14 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception:
                 return self._send_json({"started": False, "error": "bad body"}, 400)
             result = start_swarm(params)
+            return self._send_json(result, 200 if result.get("started") else 409)
+        if route == "/api/swarm/evolve/start":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                params = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                return self._send_json({"started": False, "error": "bad body"}, 400)
+            result = start_evolve(params)
             return self._send_json(result, 200 if result.get("started") else 409)
         return self._send_json({"error": "not found"}, 404)
 

@@ -5,7 +5,14 @@
       "name": "candle-viewer",
       "runtimeExecutable": ".venv/bin/python",
       "runtimeArgs": ["viewer/server.py"],
-      "port": 8010,
+      "port": 8020,
+      "autoPort": true
+    },
+    {
+      "name": "frontend-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "viewer/frontend"],
+      "port": 5173,
       "autoPort": true
     },
     {

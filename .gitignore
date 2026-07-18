@@ -43,6 +43,10 @@ bot-swarm-discussion.md
 strategy-lab-pen-review.md
 strategy-lab-screen-roadmap.md
 
+# ---- Frontend (viewer/frontend) ----
+node_modules/
+*.tsbuildinfo
+
 # ---- OS / editor cruft ----
 .DS_Store
 Thumbs.db

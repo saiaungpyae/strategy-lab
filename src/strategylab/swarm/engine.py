@@ -12,6 +12,10 @@ Execution semantics (documented simplifications are v1 choices):
 - Exit checks start the bar AFTER entry (same-bar entry+stop not modeled).
 - Sizing: fixed fractional — qty = equity * risk% * revenge_mult / stop_dist,
   capped at 3x notional leverage. Equity below ruin_frac * start => dead.
+- Perp funding: when the market dict carries a `fund` array (rate on
+  settlement bars, 0 elsewhere), open positions are charged
+  rate * qty * close * sign each settlement — longs pay positive funding.
+  Funding alone never triggers ruin; that is only checked at trade close.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ def _interp_thresholds(rule_feat, rule_q, Q, qs):
     return (v_lo * (1 - w) + v_hi * w).astype(np.float64)
 
 
-def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
+def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F, fund,
                 is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
                 thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
                 order_ttl, loss_react, cooldown_len, revenge, reentry_gap,
@@ -76,6 +80,8 @@ def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
     wins = np.zeros((m, 2), np.int64)
     expo = np.zeros((m, 2), np.int64)
     death_day = np.full(m, -1, np.int64)
+    fees = np.zeros(m, np.float64)
+    fund_paid = np.zeros(m, np.float64)
     u = np.zeros(m, np.float64)
     r2 = np.zeros(m, np.float64)
 
@@ -90,13 +96,15 @@ def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
         pos[i] = pdir[i]
         entry[i] = eff
         qty[i] = q
+        fees[i] += q * abs(eff - raw)
         stop_px[i] = raw - d * dist
         rr = tp_rr[i]
         tp_px[i] = raw + d * rr * dist if np.isfinite(rr) else d * np.inf
         held[i] = 0
         pk[i] = 0
 
-    def close_pos(i, exit_eff, t, seg):
+    def close_pos(i, exit_eff, t, seg, fee_amt):
+        fees[i] += fee_amt
         pnl = qty[i] * (exit_eff - entry[i]) * pos[i]
         eq[i] += pnl
         trades[i, seg] += 1
@@ -138,11 +146,14 @@ def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
             if pos[i] != 0 and held[i] >= 1:
                 long = pos[i] > 0
                 if (lt <= stop_px[i]) if long else (ht >= stop_px[i]):
-                    close_pos(i, stop_px[i] * (1.0 - pos[i] * taker), t, seg)
+                    close_pos(i, stop_px[i] * (1.0 - pos[i] * taker), t, seg,
+                              qty[i] * stop_px[i] * taker)
                 elif (ht >= tp_px[i]) if long else (lt <= tp_px[i]):
-                    close_pos(i, tp_px[i] * (1.0 - pos[i] * edge), t, seg)
+                    close_pos(i, tp_px[i] * (1.0 - pos[i] * edge), t, seg,
+                              qty[i] * tp_px[i] * edge)
                 elif held[i] >= max_hold[i]:
-                    close_pos(i, ct * (1.0 - pos[i] * taker), t, seg)
+                    close_pos(i, ct * (1.0 - pos[i] * taker), t, seg,
+                              qty[i] * ct * taker)
 
             # -- eligibility for new entries -------------------------------
             e = (not dead[i] and pos[i] == 0 and pk[i] == 0 and cd[i] == 0
@@ -196,6 +207,10 @@ def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
             if pos[i] != 0:
                 held[i] += 1
                 expo[i, seg] += 1
+                if fund[t] != 0.0:  # funding settles on this bar
+                    fp = fund[t] * pos[i] * qty[i] * ct
+                    eq[i] -= fp
+                    fund_paid[i] += fp
             if write_day:
                 daily[i, day_pos[t]] = eq[i] + qty[i] * (ct - entry[i]) * pos[i]
 
@@ -204,8 +219,9 @@ def _bar_kernel(o, h, l, c, A, hour, day_pos, seg_b, F,
         if pos[i] != 0:
             eq[i] += qty[i] * (c[n_bars - 1] * (1.0 - pos[i] * taker)
                                - entry[i]) * pos[i]
+            fees[i] += qty[i] * c[n_bars - 1] * taker
 
-    return daily, trades, wins, expo, eq, dead, death_day
+    return daily, trades, wins, expo, eq, dead, death_day, fees, fund_paid
 
 
 if numba is not None:
@@ -223,13 +239,18 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None, rng_salt=0):
 
     mkt keys: o,h,l,c,atr (float64), hour (int 0-23), day_pos (int index into
     the global day grid), seg_b (bool: bar in test segment), F (float32
-    [bars x feats]), Q (train quantile grid [feats x len(qs)]), qs, tf_code.
+    [bars x feats]), Q (train quantile grid [feats x len(qs)]), qs, tf_code,
+    and optionally fund (float64 funding rate on settlement bars, 0 elsewhere;
+    absent => no funding costs).
     """
     m = len(idx)
     if m == 0:
         return
     o, h, l, c = mkt["o"], mkt["h"], mkt["l"], mkt["c"]
     A, hour, day_pos, seg_b, F = mkt["atr"], mkt["hour"], mkt["day_pos"], mkt["seg_b"], mkt["F"]
+    fund = mkt.get("fund")
+    if fund is None:
+        fund = np.zeros(len(c))
 
     taker = cfg["taker_bps"] / 1e4
     edge = cfg["maker_bps"] / 1e4
@@ -265,8 +286,8 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None, rng_salt=0):
     rng = np.random.default_rng(cfg["seed"] * 7919 + int(mkt["tf_code"]) + rng_salt)
 
     fn = _bar_kernel if numba is not None else _bar_loop_py
-    daily, trades, wins, expo, eq, dead, death_day = fn(
-        o, h, l, c, A, hour, day_pos, seg_b, F,
+    daily, trades, wins, expo, eq, dead, death_day, fees, fund_paid = fn(
+        o, h, l, c, A, hour, day_pos, seg_b, F, fund,
         is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
         thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
         order_ttl, loss_react.astype(np.int64), cooldown_len, revenge,
@@ -282,9 +303,11 @@ def run_cohort(mkt, g, idx, cfg, out, progress=None, rng_salt=0):
     out["bars_b"][idx] = int(seg_b[WARMUP:].sum())
     out["death_day"][idx] = death_day
     out["dead"][idx] = dead
+    out["fees"][idx] = fees
+    out["fund_paid"][idx] = fund_paid
 
 
-def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
+def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F, fund,
                  is_ctrl, ctrl_rate, rule_feat, rule_dir, rule_op_gt, rule_act,
                  thr, dir_bias, risk, stop_atr, tp_rr, max_hold, maker_off,
                  order_ttl, loss_react, cooldown_len, revenge, reentry_gap,
@@ -316,6 +339,8 @@ def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
     wins = np.zeros((m, 2), dtype=np.int64)
     expo = np.zeros((m, 2), dtype=np.int64)
     death_day = np.full(m, -1, dtype=np.int64)
+    fees = np.zeros(m)
+    fund_paid = np.zeros(m)
 
     def open_position(who, raw_px, eff_px, at):
         """who: cohort indices. raw_px: intended price (stop math), eff_px:
@@ -327,13 +352,15 @@ def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
         pos[who] = pdir[who]
         entry[who] = eff_px
         qty[who] = q
+        fees[who] += q * np.abs(eff_px - raw_px)
         stop_px[who] = raw_px - d * dist
         rr = tp_rr[who]
         tp_px[who] = np.where(np.isfinite(rr), raw_px + d * rr * dist, d * np.inf)
         held[who] = 0
 
-    def close_positions(who, exit_eff, t):
+    def close_positions(who, exit_eff, t, fee_amt):
         seg = 1 if seg_b[t] else 0
+        fees[who] += fee_amt
         pnl = qty[who] * (exit_eff - entry[who]) * pos[who]
         eq[who] += pnl
         trades[who, seg] += 1
@@ -384,13 +411,16 @@ def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
 
             s_ = act[stop_hit]
             if len(s_):
-                close_positions(s_, stop_px[s_] * (1 - pos[s_] * taker), t)
+                close_positions(s_, stop_px[s_] * (1 - pos[s_] * taker), t,
+                                qty[s_] * stop_px[s_] * taker)
             p_ = act[tp_hit]
             if len(p_):
-                close_positions(p_, tp_px[p_] * (1 - pos[p_] * edge), t)
+                close_positions(p_, tp_px[p_] * (1 - pos[p_] * edge), t,
+                                qty[p_] * tp_px[p_] * edge)
             x_ = act[time_hit]
             if len(x_):
-                close_positions(x_, ct * (1 - pos[x_] * taker), t)
+                close_positions(x_, ct * (1 - pos[x_] * taker), t,
+                                qty[x_] * ct * taker)
 
         # -- 3. new entries (decided at close, fill from next bar) --------
         elig = (~dead & (pos == 0) & (pk == 0) & (cd == 0)
@@ -425,6 +455,10 @@ def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
         in_pos = pos != 0
         held[in_pos] += 1
         expo[in_pos, 1 if seg_b[t] else 0] += 1
+        if fund[t] != 0.0:  # funding settles on this bar
+            fp = fund[t] * pos[in_pos] * qty[in_pos] * ct
+            eq[in_pos] -= fp
+            fund_paid[in_pos] += fp
 
         if t + 1 >= n_bars or day_pos[t + 1] != day_pos[t]:
             daily[:, day_pos[t]] = eq + qty * (ct - entry) * pos
@@ -433,5 +467,6 @@ def _bar_loop_py(o, h, l, c, A, hour, day_pos, seg_b, F,
     open_ = np.flatnonzero(pos != 0)
     if len(open_):
         eq[open_] += qty[open_] * (c[-1] * (1 - pos[open_] * taker) - entry[open_]) * pos[open_]
+        fees[open_] += qty[open_] * c[-1] * taker
 
-    return daily, trades, wins, expo, eq, dead, death_day
+    return daily, trades, wins, expo, eq, dead, death_day, fees, fund_paid

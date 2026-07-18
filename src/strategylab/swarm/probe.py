@@ -35,8 +35,9 @@ TF = {"15m": {"file_arg": "file15", "bars_per_day": 96, "tf_code": 1},
       "1h": {"file_arg": "file1h", "bars_per_day": 24, "tf_code": 1}}
 
 
-def build_grid(feature_names: list[str], bars_per_day: int):
-    fi = feature_names.index("top_ls_pos")
+def build_grid(feature_names: list[str], bars_per_day: int,
+               feature: str = "top_ls_pos"):
+    fi = feature_names.index(feature)
     rows = []
     for q in ENTRY_Q:
         for stop in STOP_ATR:
@@ -91,10 +92,11 @@ def cmd_probe(args) -> None:
         all_days, np.datetime64(pd.Timestamp(split_ts, unit="ms"), "D")))
     qs = np.linspace(0.02, 0.98, 49)
     mkt, names = _market(df, tf["tf_code"], tf["bars_per_day"], split_ts, all_days, qs)
-    if "top_ls_pos" not in names:
-        raise SystemExit("top_ls_pos missing — pass --metrics")
+    feature = getattr(args, "feature", "top_ls_pos")
+    if feature not in names:
+        raise SystemExit(f"{feature} missing — pass --metrics/--funding")
 
-    g, labels = build_grid(names, tf["bars_per_day"])
+    g, labels = build_grid(names, tf["bars_per_day"], feature)
     cfg = {"taker_bps": args.taker_bps, "maker_bps": args.maker_bps,
            "start_capital": args.start_capital, "ruin_frac": args.ruin, "seed": 0}
     out = _alloc(g.n, len(all_days))
@@ -124,11 +126,11 @@ def cmd_probe(args) -> None:
 
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
-    res.to_csv(run_dir / f"toptrader_fade_grid_{args.tf}.csv", index=False)
+    res.to_csv(run_dir / f"{feature}_fade_grid_{args.tf}.csv", index=False)
 
     # honest selection: best on TRAIN (min activity), judged on TEST
     ok = (res["trades"] >= 30) & res["sharpe_a"].notna()
-    lines = [f"# Top-trader-fade probe ({args.tf}) — {datetime.now().date()}",
+    lines = [f"# {feature}-fade probe ({args.tf}) — {datetime.now().date()}",
              "",
              f"Span {all_days[0]} → {all_days[-1]}, split {all_days[split_day]} "
              f"(train {args.split:.0%}). {args.tf} maker entries (0 fee + "
@@ -157,6 +159,6 @@ def cmd_probe(args) -> None:
         yr = " | ".join(f"{y}: {yr_cols[y][bi]*100:+.1f}% (B&H {bh_year[y]*100:+.1f}%)"
                         for y in sorted(yr_cols))
         lines += [f"- per-year (train-selected config): {yr}", ""]
-    (run_dir / f"toptrader_fade_probe_{args.tf}.md").write_text("\n".join(lines))
+    (run_dir / f"{feature}_fade_probe_{args.tf}.md").write_text("\n".join(lines))
     print("\n".join(lines))
-    print(f"\ngrid csv + report -> {run_dir}/toptrader_fade_probe_{args.tf}.md")
+    print(f"\ngrid csv + report -> {run_dir}/{feature}_fade_probe_{args.tf}.md")
