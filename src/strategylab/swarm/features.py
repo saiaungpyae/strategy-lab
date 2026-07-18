@@ -216,6 +216,32 @@ def fetch_funding(symbol: str, since: str, out_dir: Path) -> Path:
     return out
 
 
+def level_drift(F: np.ndarray, names: list[str],
+                bar_days: np.ndarray) -> list[tuple[str, float]]:
+    """Stationarity guard: per feature, the range of its yearly medians in
+    units of its full-sample IQR. Scores >~1 mean quantile thresholds anchored
+    to long history can go permanently out of reach — discovered when ETH's
+    top_ls_pos level tripled and a capitulation rule went dead for two years."""
+    years = bar_days.astype("datetime64[Y]")
+    out = []
+    for j, name in enumerate(names):
+        x = F[:, j].astype(np.float64)
+        ok = np.isfinite(x)
+        if ok.sum() < 1000:
+            out.append((name, float("nan")))
+            continue
+        q25, q75 = np.nanpercentile(x[ok], [25, 75])
+        iqr = max(q75 - q25, 1e-12)
+        meds = []
+        for y in np.unique(years[ok]):
+            m = np.nanmedian(x[ok & (years == y)])
+            if np.isfinite(m):
+                meds.append(m)
+        score = (max(meds) - min(meds)) / iqr if len(meds) >= 2 else float("nan")
+        out.append((name, float(score)))
+    return out
+
+
 def merge_funding(df: pd.DataFrame, funding_csv: Path) -> pd.DataFrame:
     """Backward as-of merge; each candle sees the last settled funding rate.
 

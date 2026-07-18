@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import engine, genome, recap
+from . import engine, features, genome, recap
 from .evolve import _alloc
 
 ENTRY_Q = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
@@ -96,6 +96,15 @@ def cmd_probe(args) -> None:
     if feature not in names:
         raise SystemExit(f"{feature} missing — pass --metrics/--funding")
 
+    bar_days = df["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]")
+    drift = dict(features.level_drift(mkt["F"], names, bar_days))[feature]
+    drift_warn = ""
+    if np.isfinite(drift) and drift > 1.0:
+        drift_warn = (f"⚠ {feature} level-drift score {drift:.2f} — yearly medians span "
+                      f">1 IQR, so quantile thresholds vs long history may sit "
+                      f"permanently out of reach on parts of this span (ETH failure mode)")
+        print(drift_warn)
+
     g, labels = build_grid(names, tf["bars_per_day"], feature)
     cfg = {"taker_bps": args.taker_bps, "maker_bps": args.maker_bps,
            "start_capital": args.start_capital, "ruin_frac": args.ruin, "seed": 0}
@@ -137,6 +146,8 @@ def cmd_probe(args) -> None:
              f"{args.maker_bps} bp edge), stops/time exits pay taker "
              f"{args.taker_bps} bps. {len(res)} configs "
              f"({len(res)//2} per family), risk 0.5%/trade.", ""]
+    if drift_warn:
+        lines += [drift_warn, ""]
     for fam in ("fade_short", "mirror_long"):
         sub = res[(res["family"] == fam) & ok]
         lines.append(f"## {fam} ({len(sub)} active configs)")

@@ -357,6 +357,27 @@ def main() -> None:
 
     from . import mirror as _mirror
     _mirror.add_parser(sub)
+    from . import track as _track
+    _track.add_parser(sub)
+
+    dr = sub.add_parser("drift", help="feature level-drift report (stationarity guard)")
+    dr.add_argument("--file", default="data/binance_BTC-USDT_15m.csv")
+    dr.add_argument("--metrics", default=None)
+    dr.add_argument("--funding", default=None)
+    dr.add_argument("--since", default="2021-01-01")
+
+    def _drift(a):
+        df = _load(a.file, a.since, a.metrics, a.funding)
+        F, names = features.compute_features(df, 96)
+        bar_days = df["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]")
+        print(f"level-drift scores (yearly-median range / IQR) — {a.file}")
+        print("scores >~1 mean quantile thresholds anchored to long history can go")
+        print("permanently out of reach (the ETH top_ls_pos failure mode):\n")
+        for name, score in sorted(features.level_drift(F, names, bar_days),
+                                  key=lambda x: -(x[1] if np.isfinite(x[1]) else -9)):
+            flag = "  ⚠ NON-STATIONARY" if np.isfinite(score) and score > 1.0 else ""
+            print(f"  {name:14s} {score:6.2f}{flag}")
+    dr.set_defaults(func=_drift)
 
     args = ap.parse_args()
     args.func(args)
