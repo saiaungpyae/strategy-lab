@@ -456,7 +456,34 @@ export interface EvoBotPayload {
   start_capital?: number
   windows: EvoWindow[]
   test: { start?: string; days?: string[] }
+  // run-level context for the worst-case panel: generation count and the
+  // null cohorts' best test Sharpe (the run's luck ceilings)
+  run_ctx?: { gens?: number | null; placebo_max?: number | null; fresh_max?: number | null }
   bot: EvoBotRecord
+}
+
+// One engineered 90-day future from the stress forecast battery.
+export interface StressScenario {
+  key: string
+  label: string
+  desc: string
+  eq: number[] // daily equity multiplier, ×1.00 start
+  px: number[] // daily scenario price, normalized to 1.0
+  ret_pct: number
+  maxdd_pct: number
+  trades: number
+  dead: boolean
+  fees: number
+}
+
+export interface EvoStressPayload {
+  error?: string
+  run_id: string
+  bot_id: number
+  tf: string
+  days: number
+  scenarios: StressScenario[]
+  note?: string
 }
 
 // One replayed position of a hall-of-fame bot (times are epoch seconds).

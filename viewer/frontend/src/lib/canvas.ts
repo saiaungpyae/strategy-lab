@@ -265,6 +265,187 @@ export function scatter(parent: HTMLElement, pts: [number, number, number][]) {
   g.restore()
 }
 
+// Worst-case panel: per-window Sharpe report card. Green above zero, red
+// below; ★ marks the window the bot was selected on (in-sample by
+// construction); the reserved test span gets a warn-colored label.
+export function regimeBars(
+  parent: HTMLElement,
+  labels: string[],
+  vals: (number | null)[],
+  bornIdx: number,
+  hCss = 170,
+) {
+  const { g, w, h } = cv(parent, hCss)
+  const P = { l: 40, r: 10, t: 16, b: 22 }
+  let lo = 0
+  let hi = 0
+  vals.forEach((v) => {
+    if (v != null) {
+      lo = Math.min(lo, v)
+      hi = Math.max(hi, v)
+    }
+  })
+  if (!(hi > lo)) hi = lo + 1
+  const pad = (hi - lo) * 0.12
+  lo -= pad
+  hi += pad
+  const bw = (w - P.l - P.r) / vals.length
+  const Y = (v: number) => h - P.b - ((h - P.t - P.b) * (v - lo)) / (hi - lo)
+  axis(g, P.l, h - P.b, w - P.r, P.t)
+  // zero line
+  g.strokeStyle = C.muted
+  g.setLineDash([3, 3])
+  g.beginPath()
+  g.moveTo(P.l, Y(0) + 0.5)
+  g.lineTo(w - P.r, Y(0) + 0.5)
+  g.stroke()
+  g.setLineDash([])
+  vals.forEach((v, i) => {
+    const x = P.l + i * bw + 4
+    const isTest = labels[i] === 'test'
+    if (v != null) {
+      g.fillStyle =
+        v >= 0 ? (isTest ? 'rgba(240,180,41,.75)' : 'rgba(38,166,154,.7)') : 'rgba(239,83,80,.7)'
+      g.fillRect(x, Math.min(Y(v), Y(0)), bw - 8, Math.max(Math.abs(Y(v) - Y(0)), 1))
+      g.fillStyle = v >= 0 ? C.text : C.down
+      g.font = '10px sans-serif'
+      g.textAlign = 'center'
+      g.fillText(fmt(v, 1), x + (bw - 8) / 2, v >= 0 ? Y(v) - 3 : Y(v) + 11)
+    }
+    g.fillStyle = isTest ? C.warn : C.muted
+    g.font = '10px sans-serif'
+    g.textAlign = 'center'
+    g.fillText((i === bornIdx ? '★' : '') + labels[i], x + (bw - 8) / 2, h - 8)
+  })
+  // y ticks
+  g.fillStyle = C.muted
+  g.font = '10px sans-serif'
+  g.textAlign = 'right'
+  for (let i = 0; i <= 2; i++) {
+    const v = lo + ((hi - lo) * i) / 2
+    g.fillText(fmt(v, 1), P.l - 5, Y(v) + 3)
+  }
+}
+
+// Worst-case panel: underwater curve — % below the running equity peak over
+// the whole walk-forward record. The only chart where flat-at-zero is good.
+export function underwater(
+  parent: HTMLElement,
+  days: string[],
+  ddPct: number[],
+  splitIdx: number | null,
+  hCss = 150,
+) {
+  const { g, w, h } = cv(parent, hCss)
+  const P = { l: 44, r: 10, t: 10, b: 22 }
+  const lo = Math.min(-1, ...ddPct) * 1.1
+  const X = (i: number) => P.l + ((w - P.l - P.r) * i) / (ddPct.length - 1)
+  const Y = (v: number) => P.t + ((h - P.t - P.b) * v) / lo
+  axis(g, P.l, h - P.b, w - P.r, P.t)
+  g.fillStyle = 'rgba(239,83,80,.35)'
+  g.strokeStyle = C.down
+  g.lineWidth = 1.2
+  g.beginPath()
+  g.moveTo(X(0), Y(0))
+  ddPct.forEach((v, i) => g.lineTo(X(i), Y(v)))
+  g.lineTo(X(ddPct.length - 1), Y(0))
+  g.closePath()
+  g.fill()
+  g.beginPath()
+  ddPct.forEach((v, i) => (i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v))))
+  g.stroke()
+  // deepest point marker
+  let mi = 0
+  ddPct.forEach((v, i) => {
+    if (v < ddPct[mi]) mi = i
+  })
+  g.fillStyle = C.down
+  g.beginPath()
+  g.arc(X(mi), Y(ddPct[mi]), 2.5, 0, 7)
+  g.fill()
+  g.font = '10px sans-serif'
+  g.textAlign = mi > ddPct.length / 2 ? 'right' : 'left'
+  g.fillText(fmt(ddPct[mi], 1) + '%', X(mi) + (mi > ddPct.length / 2 ? -5 : 5), Y(ddPct[mi]) + 3)
+  if (splitIdx != null && splitIdx >= 0) {
+    g.strokeStyle = C.warn
+    g.setLineDash([5, 4])
+    g.beginPath()
+    g.moveTo(X(splitIdx), h - P.b)
+    g.lineTo(X(splitIdx), P.t)
+    g.stroke()
+    g.setLineDash([])
+    g.fillStyle = C.warn
+    g.textAlign = 'center'
+    g.fillText('test', X(splitIdx), P.t - 1)
+  }
+  g.fillStyle = C.muted
+  g.textAlign = 'right'
+  g.fillText('0%', P.l - 5, Y(0) + 3)
+  g.fillText(fmt(lo, 0) + '%', P.l - 5, Y(lo) + 3)
+  g.textAlign = 'left'
+  g.fillText(days[0] ?? '', P.l, h - 8)
+  g.textAlign = 'right'
+  g.fillText(days[days.length - 1] ?? '', w - P.r, h - 8)
+}
+
+// Worst-case panel: histogram of bootstrap-resampled test outcomes ("alternate
+// histories" — same daily returns, shuffled with replacement). Marks 0%, the
+// 5th percentile, and what actually happened.
+export function outcomeHist(
+  parent: HTMLElement,
+  finalsPct: number[],
+  actualPct: number | null,
+  p5Pct: number,
+  hCss = 170,
+) {
+  const { g, w, h } = cv(parent, hCss)
+  const P = { l: 14, r: 14, t: 16, b: 22 }
+  const lo = Math.min(...finalsPct, 0)
+  const hi = Math.max(...finalsPct, actualPct ?? 0)
+  const span = hi - lo || 1
+  const NB = 41
+  const counts = new Array(NB).fill(0)
+  finalsPct.forEach((v) => {
+    const bi = Math.min(NB - 1, Math.max(0, Math.floor(((v - lo) / span) * NB)))
+    counts[bi]++
+  })
+  const cmax = Math.max(...counts, 1)
+  const X = (v: number) => P.l + ((w - P.l - P.r) * (v - lo)) / span
+  const Y = (n: number) => h - P.b - ((h - P.t - P.b) * n) / (cmax * 1.08)
+  axis(g, P.l, h - P.b, w - P.r, P.t)
+  const bw = (w - P.l - P.r) / NB
+  counts.forEach((n, i) => {
+    if (!n) return
+    const vMid = lo + ((i + 0.5) / NB) * span
+    g.fillStyle = vMid < 0 ? 'rgba(239,83,80,.45)' : 'rgba(38,166,154,.45)'
+    g.fillRect(P.l + i * bw + 0.5, Y(n), bw - 1, h - P.b - Y(n))
+  })
+  const ref = (v: number | null, col: string, dash: number[], label: string, lvl = 0) => {
+    if (v == null || v < lo || v > hi) return
+    g.strokeStyle = col
+    g.setLineDash(dash)
+    g.beginPath()
+    g.moveTo(X(v), h - P.b)
+    g.lineTo(X(v), P.t)
+    g.stroke()
+    g.setLineDash([])
+    g.fillStyle = col
+    g.font = '10px sans-serif'
+    g.textAlign = X(v) > w * 0.75 ? 'right' : 'left'
+    g.fillText(label, X(v) + (X(v) > w * 0.75 ? -3 : 3), P.t + 9 + lvl * 11)
+  }
+  ref(actualPct, C.warn, [], 'actual ' + fmt(actualPct ?? 0, 0) + '%', 0)
+  ref(p5Pct, C.down, [2, 3], 'p5 ' + fmt(p5Pct, 0) + '%', 1)
+  ref(0, C.muted, [4, 3], 'break-even', 2)
+  g.fillStyle = C.muted
+  g.font = '10px sans-serif'
+  g.textAlign = 'center'
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (span * i) / 4
+    g.fillText(fmt(v, 0) + '%', X(v), h - 8)
+  }
+}
+
 export function vbars(parent: HTMLElement, vals: number[], labels: string[], color: string) {
   const { g, w, h } = cv(parent, 200)
   const P = { l: 40, r: 10, t: 14, b: 26 }

@@ -5,6 +5,8 @@ import { lines } from '../../lib/canvas'
 import { C } from '../../lib/colors'
 import { getJSON } from '../../lib/api'
 import { fmt, money } from '../../lib/format'
+import StressForecast from './StressForecast'
+import WorstCase from './WorstCase'
 import type { EvoBotPayload } from '../../types'
 
 const v = (x: number | string | null | undefined, d = 2) =>
@@ -242,6 +244,8 @@ export default function EvoBot() {
                     deps={[b.bot_id, run, eqDays.length, eqMode]}
                   />
                 </div>
+                <WorstCase data={data} />
+                <StressForecast run={run} botId={botId} />
               </>
             ) : (
               <div className="card" style={{ gridColumn: 'span 12' }}>

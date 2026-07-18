@@ -735,6 +735,13 @@ def evo_bot_payload(run_id: str, bot_id: int) -> dict:
     d = safe_swarm_dir(run_id)
     if d is None or not (d / "evolution.json").is_file():
         return {"error": "run not found"}
+    # run-level context for the bot page's worst-case panel: the null cohorts'
+    # luck ceilings (a single bot below these is within plain luck's reach)
+    e = _read_json(d / "evolution.json") or {}
+    ft = e.get("final_test") or {}
+    ctx = {"gens": e.get("gens"),
+           "placebo_max": (ft.get("placebo") or {}).get("max_sharpe"),
+           "fresh_max": (ft.get("fresh_random") or {}).get("max_sharpe")}
     hp = d / "hof_history.json"
     if hp.is_file():
         h = _evo_history(str(d), hp.stat().st_mtime) or {}
@@ -745,13 +752,13 @@ def evo_bot_payload(run_id: str, bot_id: int) -> dict:
         return {"run_id": run_id, "has_history": True,
                 "start_capital": float(h.get("start_capital", 10_000.0)),
                 "windows": h.get("windows", []), "test": h.get("test", {}),
-                "bot": rec}
+                "run_ctx": ctx, "bot": rec}
     if (d / "hof_test.csv").is_file():
         rec = next((r for r in _hof_csv_rows(d) if r["bot_id"] == bot_id), None)
         if rec is None:
             return {"error": "bot not found"}
         return {"run_id": run_id, "has_history": False, "windows": [],
-                "test": {}, "bot": rec}
+                "test": {}, "run_ctx": ctx, "bot": rec}
     return {"error": "bot not found"}
 
 
@@ -864,6 +871,68 @@ def evo_bot_trades_payload(run_id: str, bot_id: int) -> dict:
     if len(_trades_cache) > 64:
         _trades_cache.clear()
     _trades_cache[key] = payload
+    return payload
+
+
+_stress_cache: dict[tuple, dict] = {}
+
+
+def evo_bot_stress_payload(run_id: str, bot_id: int) -> dict:
+    """Hostile-future forecast of one HOF bot: the genome replayed by the
+    engine over engineered 90-day scenarios (crash, melt-up, grind, whipsaw,
+    vol collapse, V-shape, jammed gates) plus the last 90 real days as
+    anchor. Cached per (run, bot) — fully deterministic."""
+    key = (run_id, bot_id)
+    if key in _stress_cache:
+        return _stress_cache[key]
+    d = safe_swarm_dir(run_id)
+    if d is None or not (d / "evolution.json").is_file():
+        return {"error": "run not found"}
+    if not (d / "hof_history.json").is_file():
+        return {"error": "this run predates stress forecasts (no hof_history.json)"}
+    e = _read_json(d / "evolution.json") or {}
+    h = _evo_history(str(d), (d / "hof_history.json").stat().st_mtime) or {}
+    rec = next((b for b in h.get("bots", []) if b.get("bot_id") == bot_id), None)
+    if rec is None:
+        return {"error": "bot not found"}
+    paths = [x.get("path") for x in e.get("data") or []]
+    if len(paths) != 2:
+        return {"error": "run has no pinned data provenance"}
+    f5, f15 = _resolve_repo_path(paths[0]), _resolve_repo_path(paths[1])
+    if f5 is None or f15 is None:
+        return {"error": f"run data files are gone ({paths[0]}, {paths[1]})"}
+    metrics = _resolve_repo_path(e.get("metrics"))
+    funding = _resolve_repo_path(e.get("funding"))
+
+    from strategylab.swarm import stress
+    from strategylab.swarm.run import _load
+    mkt5, ts5, mkt15, ts15, names, qs = _evo_market(
+        str(f5), str(f15), e.get("since") or "",
+        str(metrics) if metrics else "", str(funding) if funding else "")
+    is_5m = rec.get("tf") == "5m"
+    mkt = mkt5 if is_5m else mkt15
+    df = _load(str(f5 if is_5m else f15), e.get("since") or None,
+               str(metrics) if metrics else None,
+               str(funding) if funding else None)
+    cfg = {"taker_bps": float(e.get("taker_bps") or 5.0),
+           "maker_bps": float(e.get("maker_bps") or 1.0),
+           "start_capital": float(h.get("start_capital", 10_000.0)),
+           "ruin_frac": 0.30, "seed": int(e.get("seed") or 0)}
+    try:
+        scenarios = stress.stress_bot(rec, names, df, mkt["F"], qs, cfg,
+                                      288 if is_5m else 96, mkt["tf_code"])
+    except ValueError as ex:
+        return {"error": str(ex)}
+    payload = {
+        "run_id": run_id, "bot_id": bot_id, "tf": rec.get("tf"),
+        "days": stress.DAYS, "scenarios": scenarios,
+        "note": "synthetic futures are engineered to hurt, not predicted; "
+                "volume / funding / positioning columns replay the last 90 real "
+                "days so the bot's gates see today's regime while price turns hostile",
+    }
+    if len(_stress_cache) > 64:
+        _stress_cache.clear()
+    _stress_cache[key] = payload
     return payload
 
 
@@ -1072,6 +1141,15 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError:
                 return self._send_json({"error": "bad bot id"}, 400)
             p = evo_bot_payload((q.get("id") or [""])[0], bot_id)
+            return self._send_json(p, 404 if "error" in p else 200)
+
+        if route == "/api/swarm/evo/stress":
+            q = parse_qs(parsed.query)
+            try:
+                bot_id = int((q.get("bot") or [""])[0])
+            except ValueError:
+                return self._send_json({"error": "bad bot id"}, 400)
+            p = evo_bot_stress_payload((q.get("id") or [""])[0], bot_id)
             return self._send_json(p, 404 if "error" in p else 200)
 
         if route == "/api/swarm/evo/trades":
