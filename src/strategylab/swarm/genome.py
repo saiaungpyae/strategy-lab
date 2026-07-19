@@ -62,7 +62,8 @@ class Genomes:
 
 
 def sample(n_bots: int, n_features: int, feature_names: list[str],
-           control_frac: float, seed: int, maker_only: bool = False) -> Genomes:
+           control_frac: float, seed: int, maker_only: bool = False,
+           allowed_tfs: list[int] | None = None) -> Genomes:
     rng = np.random.default_rng(seed)
     g = Genomes(seed=seed, feature_names=feature_names)
 
@@ -80,7 +81,11 @@ def sample(n_bots: int, n_features: int, feature_names: list[str],
     g.ctrl_rate = np.exp(rng.uniform(np.log(0.005), np.log(0.08), n_bots)).astype(np.float32)
 
     # behavior
-    g.tf = rng.choice([0, 1], size=n_bots, p=[0.6, 0.4]).astype(np.int8)
+    tf_pool = allowed_tfs if allowed_tfs else [0, 1]
+    if len(tf_pool) == 1:
+        g.tf = np.full(n_bots, tf_pool[0], dtype=np.int8)
+    else:
+        g.tf = rng.choice(tf_pool, size=n_bots, p=[0.6, 0.4]).astype(np.int8)
     g.dir_bias = rng.choice([-1, 0, 1], size=n_bots, p=[0.2, 0.6, 0.2]).astype(np.int8)
     g.risk_pct = np.exp(rng.uniform(np.log(0.001), np.log(0.03), n_bots)).astype(np.float32)
     g.stop_atr = rng.uniform(0.5, 5.0, n_bots).astype(np.float32)
@@ -126,7 +131,8 @@ def concat(parts: list[Genomes]) -> Genomes:
 
 
 def breed(g: Genomes, parents: np.ndarray, n_children: int, n_features: int,
-          rng: np.random.Generator, maker_only: bool = False) -> Genomes:
+          rng: np.random.Generator, maker_only: bool = False,
+          allowed_tfs: list[int] | None = None) -> Genomes:
     """Uniform crossover of two random parents per child, then mutation.
 
     Numeric traits get multiplicative/additive noise clipped to the sampler's
@@ -179,7 +185,8 @@ def breed(g: Genomes, parents: np.ndarray, n_children: int, n_features: int,
                                 0, 12).astype(np.int16)
     for f, p in (("tf", 0.05), ("dir_bias", 0.08), ("session", 0.08), ("loss_react", 0.08)):
         m = rng.random(n_children) < p
-        vals = {"tf": [0, 1], "dir_bias": [-1, 0, 1], "session": [0, 1, 2, 3],
+        vals = {"tf": allowed_tfs if allowed_tfs else [0, 1],
+                "dir_bias": [-1, 0, 1], "session": [0, 1, 2, 3],
                 "loss_react": [0, 1, 2]}[f]
         arr = getattr(child, f)
         arr[m] = rng.choice(vals, m.sum())

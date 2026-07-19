@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -23,10 +24,88 @@ import numpy as np
 import pandas as pd
 
 from . import engine, features, genome, recap
+from ..data import paths as datapaths
+
+
+TFS = {"5m": 0, "15m": 1}  # tf gene codes
+
+# Parser defaults, resolved once against the canonical layout (with legacy
+# flat-dir fallback). evolve's --pair guard compares against these same
+# strings, so they must be the single source of truth.
+DEF_FILE5 = datapaths.default_candles("5m")
+DEF_FILE15 = datapaths.default_candles("15m")
+DEF_FILE1H = datapaths.default_candles("1h")
+DEF_METRICS = datapaths.default_metrics()
+DEF_FUNDING = datapaths.default_funding()
+
+
+def resolve_pair(pair: str, root: str = "data",
+                 derivs: bool = False) -> tuple[str, str, str | None, str | None]:
+    """Resolve (file5, file15, metrics, funding) for a pair by the repo's
+    naming convention. Candles live under ohlcv/<PAIR>/ in the canonical
+    layout and flat at the root in snapshot / pre-migration dirs; metrics
+    under metrics/<PAIR>/, metrics/ or next to the candles — all checked."""
+    r = Path(root)
+    pdir = f"{pair}-USDT"
+
+    def first(name: str, *dirs: Path) -> Path:
+        return next((d / name for d in dirs if (d / name).is_file()), dirs[0] / name)
+
+    f5 = first(f"binance_{pdir}_5m.csv", r / "ohlcv" / pdir, r)
+    f15 = first(f"binance_{pdir}_15m.csv", r / "ohlcv" / pdir, r)
+    metrics = funding = None
+    if derivs:
+        mname = f"{pair}USDT_metrics.csv"
+        for mdir in (r / "metrics" / pdir, r / "metrics", r):
+            if (mdir / mname).is_file():
+                metrics = mdir / mname
+                funding = mdir / f"{pdir}-USDT_funding.csv"
+                break
+        if metrics is None:
+            raise SystemExit(f"--pair {pair}: no {mname} under {r}/metrics/{pdir}, "
+                             f"{r}/metrics or {r} — run sl-swarm fetch-metrics")
+    missing = [str(p) for p in (f5, f15, metrics, funding)
+               if p is not None and not p.is_file()]
+    if missing:
+        raise SystemExit(f"--pair {pair}: missing data files: {', '.join(missing)}")
+    return (str(f5), str(f15),
+            str(metrics) if metrics else None, str(funding) if funding else None)
+
+
+def path_symbol(path: str | None) -> str | None:
+    """Asset symbol encoded in a data file name, or None if unrecognized."""
+    if not path:
+        return None
+    name = Path(path).name
+    for pat in (r"binance_([A-Z0-9]+)-USDT_", r"([A-Z0-9]+)USDT_metrics",
+                r"([A-Z0-9]+)-USDT-USDT_funding"):
+        m = re.match(pat, name)
+        if m:
+            return m.group(1)
+    return None
+
+
+def check_symbols(*paths: str | None) -> str | None:
+    """Fail loudly when candle/metrics/funding files mix assets — a mixed set
+    would merge on timestamp and silently produce garbage features."""
+    syms = {p: path_symbol(p) for p in paths if p}
+    found = {s for s in syms.values() if s}
+    if len(found) > 1:
+        detail = ", ".join(f"{Path(p).name}→{s or '?'}" for p, s in syms.items())
+        raise SystemExit(f"asset mismatch across data files ({detail}) — "
+                         "all candles/metrics/funding must be the same pair")
+    return next(iter(found), None)
 
 
 def _load(path: str, since: str | None, metrics: str | None,
           funding: str | None = None) -> pd.DataFrame:
+    # stored paths (frozen configs, old run artifacts) may predate the
+    # per-pair data layout — resolve them to where the files live now
+    path = str(datapaths.locate(path))
+    if metrics:
+        metrics = str(datapaths.locate(metrics))
+    if funding:
+        funding = str(datapaths.locate(funding))
     # transparent parquet sidecar: ~8x faster to parse than the csv
     pq = Path(path).with_suffix(".parquet")
     if pq.exists() and pq.stat().st_mtime >= Path(path).stat().st_mtime:
@@ -230,7 +309,8 @@ def cmd_run(args) -> None:
 
 
 def cmd_fetch_metrics(args) -> None:
-    features.fetch_metrics(args.symbol, args.since, args.until, Path(args.out))
+    out = Path(args.out) / datapaths.pair_dir(args.symbol)
+    features.fetch_metrics(args.symbol, args.since, args.until, out)
 
 
 def cmd_report(args) -> None:
@@ -262,8 +342,8 @@ def main() -> None:
     r = sub.add_parser("run", help="simulate a swarm")
     r.add_argument("--jobs", type=int, default=0,
                    help="worker processes for simulation (0 = auto, 1 = serial)")
-    r.add_argument("--file5", default="data/binance_BTC-USDT_5m.csv")
-    r.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
+    r.add_argument("--file5", default=DEF_FILE5)
+    r.add_argument("--file15", default=DEF_FILE15)
     r.add_argument("--metrics", default=None, help="metrics CSV from fetch-metrics")
     r.add_argument("--funding", default=None, help="funding CSV from fetch-funding")
     r.add_argument("--maker-only", action="store_true",
@@ -284,22 +364,40 @@ def main() -> None:
     f.add_argument("--symbol", default="BTCUSDT")
     f.add_argument("--since", required=True)
     f.add_argument("--until", default=None)
-    f.add_argument("--out", default="data/metrics")
+    f.add_argument("--out", default="data/metrics",
+                   help="metrics root (files land under <out>/<PAIR>/)")
     f.set_defaults(func=cmd_fetch_metrics)
 
     fu = sub.add_parser("fetch-funding", help="download perp funding-rate history (ccxt)")
     fu.add_argument("--symbol", default="BTC/USDT:USDT")
     fu.add_argument("--since", required=True)
-    fu.add_argument("--out", default="data/metrics")
-    fu.set_defaults(func=lambda a: features.fetch_funding(a.symbol, a.since, Path(a.out)))
+    fu.add_argument("--out", default="data/metrics",
+                    help="metrics root (files land under <out>/<PAIR>/)")
+    fu.set_defaults(func=lambda a: features.fetch_funding(
+        a.symbol, a.since, Path(a.out) / datapaths.pair_dir(a.symbol)))
 
     p = sub.add_parser("report", help="rebuild recap.json for an existing run")
     p.add_argument("--run", required=True)
     p.set_defaults(func=cmd_report)
 
     e = sub.add_parser("evolve", help="walk-forward generational evolution + placebo lineage")
-    e.add_argument("--file5", default="data/binance_BTC-USDT_5m.csv")
-    e.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
+    e.add_argument("--pair", default=None, metavar="SYM",
+                   help="asset symbol (BTC, ETH, BNB, …) — resolves candle "
+                        "files (and metrics/funding with --derivs) from "
+                        "--data-root by naming convention; mutually exclusive "
+                        "with explicit --file5/--file15/--metrics/--funding")
+    e.add_argument("--data-root", default="data",
+                   help="root dir for --pair resolution (e.g. a pinned "
+                        "snapshot like data/snapshots/pin-20260718)")
+    e.add_argument("--derivs", action="store_true",
+                   help="with --pair: also wire the pair's metrics + funding "
+                        "(derivative features and funding costs)")
+    e.add_argument("--tfs", default="5m,15m",
+                   help="comma list of timeframes the gene pool may use "
+                        "(subset of 5m,15m); excluded tapes skip their "
+                        "feature pass entirely")
+    e.add_argument("--file5", default=DEF_FILE5)
+    e.add_argument("--file15", default=DEF_FILE15)
     e.add_argument("--metrics", default=None)
     e.add_argument("--funding", default=None)
     e.add_argument("--maker-only", action="store_true")
@@ -320,7 +418,10 @@ def main() -> None:
     e.add_argument("--hof-per-gen", type=int, default=0,
                    help="hall-of-fame slots per generation (0 = auto: max(10, bots/1000))")
     e.add_argument("--seed", type=int, default=42)
-    e.add_argument("--since", default="2021-01-01")
+    e.add_argument("--since", default="2021-01-01",
+                   help="training span start, or 'auto' = first date the "
+                        "pair's metrics cover (avoids grading crippled "
+                        "half-genomes on pre-coverage windows)")
     e.add_argument("--taker-bps", type=float, default=5.0)
     e.add_argument("--maker-bps", type=float, default=1.0)
     e.add_argument("--start-capital", type=float, default=10_000.0)
@@ -338,10 +439,10 @@ def main() -> None:
     pr.add_argument("--feature", default="top_ls_pos",
                     help="feature to fade (e.g. global_ls, top_ls_pos)")
     pr.add_argument("--tf", choices=["15m", "1h"], default="15m")
-    pr.add_argument("--file1h", default="data/binance_BTC-USDT_1h.csv")
-    pr.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
-    pr.add_argument("--metrics", default="data/metrics/BTCUSDT_metrics.csv")
-    pr.add_argument("--funding", default="data/metrics/BTC-USDT-USDT_funding.csv")
+    pr.add_argument("--file1h", default=DEF_FILE1H)
+    pr.add_argument("--file15", default=DEF_FILE15)
+    pr.add_argument("--metrics", default=DEF_METRICS)
+    pr.add_argument("--funding", default=DEF_FUNDING)
     pr.add_argument("--since", default="2021-01-06")
     pr.add_argument("--split", type=float, default=0.70)
     pr.add_argument("--taker-bps", type=float, default=5.0)
@@ -361,7 +462,7 @@ def main() -> None:
     _track.add_parser(sub)
 
     dr = sub.add_parser("drift", help="feature level-drift report (stationarity guard)")
-    dr.add_argument("--file", default="data/binance_BTC-USDT_15m.csv")
+    dr.add_argument("--file", default=DEF_FILE15)
     dr.add_argument("--metrics", default=None)
     dr.add_argument("--funding", default=None)
     dr.add_argument("--since", default="2021-01-01")

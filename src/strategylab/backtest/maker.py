@@ -14,7 +14,7 @@ Each strategy is run two ways for comparison:
 
 Usage:
     ./.venv/bin/python maker_backtest.py
-    ./.venv/bin/python maker_backtest.py --file data/binance_BTC-USDT_15m.csv
+    ./.venv/bin/python maker_backtest.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv
     ./.venv/bin/python maker_backtest.py --taker-fee 0.001 --rebate 0.0001 --max-wait 24
 """
 
@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from strategylab.core import Indicators, PPY
+from strategylab.data.paths import default_candles
 
 
 # ----------------------------------------------------------------------------
@@ -170,7 +171,7 @@ def build_strategies(ind: Indicators, offset: float):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_1h.csv")
+    p.add_argument("--file", "-f", default=default_candles("1h"))
     p.add_argument("--taker-fee", type=float, default=0.001, help="Taker fee (default 0.10%%)")
     p.add_argument("--rebate", type=float, default=0.0,
                    help="Maker rebate as a fraction; models 'get paid to provide liquidity'. "

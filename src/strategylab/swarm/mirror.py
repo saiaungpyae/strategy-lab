@@ -28,6 +28,7 @@ import pandas as pd
 
 from . import engine
 from .evolve import _alloc
+from ..data import paths as datapaths
 from .probe import TF, build_grid
 
 TFS = {"15m": ("file15", 96), "1h": ("file1h", 24), "4h": ("file4h", 6)}
@@ -315,11 +316,11 @@ paint(); addEventListener('resize',()=>{{clearTimeout(window.__r);window.__r=set
 
 def add_parser(sub):
     m = sub.add_parser("mirror-report", help="mirror_long tearsheet + SMA blend")
-    m.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
-    m.add_argument("--file1h", default="data/binance_BTC-USDT_1h.csv")
-    m.add_argument("--file4h", default="data/binance_BTC-USDT_4h.csv")
-    m.add_argument("--metrics", default="data/metrics/BTCUSDT_metrics.csv")
-    m.add_argument("--funding", default="data/metrics/BTC-USDT-USDT_funding.csv")
+    m.add_argument("--file15", default=datapaths.default_candles("15m"))
+    m.add_argument("--file1h", default=datapaths.default_candles("1h"))
+    m.add_argument("--file4h", default=datapaths.default_candles("4h"))
+    m.add_argument("--metrics", default=datapaths.default_metrics())
+    m.add_argument("--funding", default=datapaths.default_funding())
     m.add_argument("--since", default="2021-01-06")
     m.add_argument("--split", type=float, default=0.70)
     m.add_argument("--taker-bps", type=float, default=5.0)

@@ -115,6 +115,7 @@ export default function EvoBot() {
               <h3>Ideology</h3>
               <div style={{ fontSize: 14, margin: '4px 0 10px' }}>{b.rules}</div>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {data.run_ctx?.pair && <Chip label="pair" value={data.run_ctx.pair} />}
                 <Chip label="born gen" value={String(b.born_gen ?? '—')} />
                 <Chip label="tf" value={String(b.tf ?? '—')} />
                 <Chip label="session" value={String(b.session ?? '—')} />

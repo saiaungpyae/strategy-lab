@@ -371,6 +371,9 @@ export interface EvoRun {
     corr_oos_consistency_vs_test: number | null
   }
   funding?: string | null
+  pair?: string | null
+  tfs?: string[] | null
+  metrics_coverage?: string | null
   final_test?: Record<string, EvoGroupStats>
   hof_top?: HofRow[]
 }
@@ -378,6 +381,7 @@ export interface EvoRun {
 export interface EvosPayload {
   evos: EvoRun[]
   running: boolean
+  pairs?: { pair: string; has_metrics: boolean }[]
 }
 
 export interface StartResult {
@@ -410,6 +414,7 @@ export interface EvoBotSummary {
   session: string
   dir_bias?: string
   risk_pct: number | null
+  oos_sharpe?: number | null
   test_sharpe: number | null
   test_trades: number | null
   test_ret_pct?: number | null
@@ -456,9 +461,14 @@ export interface EvoBotPayload {
   start_capital?: number
   windows: EvoWindow[]
   test: { start?: string; days?: string[] }
-  // run-level context for the worst-case panel: generation count and the
-  // null cohorts' best test Sharpe (the run's luck ceilings)
-  run_ctx?: { gens?: number | null; placebo_max?: number | null; fresh_max?: number | null }
+  // run-level context for the worst-case panel: generation count, pair and
+  // the null cohorts' best test Sharpe (the run's luck ceilings)
+  run_ctx?: {
+    gens?: number | null
+    pair?: string | null
+    placebo_max?: number | null
+    fresh_max?: number | null
+  }
   bot: EvoBotRecord
 }
 

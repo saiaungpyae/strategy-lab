@@ -707,7 +707,8 @@ async function renderEvolution(el) {
       <label class="muted">bots <input id="evBots" type="number" value="1500" min="100" max="200000" style="width:80px"></label>
       <label class="muted">gens <input id="evGens" type="number" value="6" min="2" max="30" style="width:60px"></label>
       <label class="muted">test % <input id="evTest" type="number" value="20" min="5" max="50" style="width:60px"></label>
-      <label class="muted">fitness <select id="evFit"><option value="sharpe">sharpe</option><option value="return">return</option></select></label>
+      <label class="muted">fitness <select id="evFit"><option value="sharpe">sharpe</option><option value="return">return</option><option value="balanced">balanced</option></select></label>
+      <label class="muted" title="what admits bots to the hall of fame — 'sharpe' keeps regime-riders out when breeding on another fitness">HOF by <select id="evHof"><option value="fitness">fitness</option><option value="sharpe">sharpe</option></select></label>
       <label class="muted">maker bps <input id="evMbps" type="number" value="1" min="0" max="50" step="0.5" style="width:60px"></label>
       <label class="muted"><input id="evMk" type="checkbox"> maker-only</label>
       <label class="muted" title="adds OI/long-short/funding features and charges perp funding to open positions"><input id="evDerivs" type="checkbox"> OI + funding</label>
@@ -724,6 +725,7 @@ async function renderEvolution(el) {
   $('#evoGo').addEventListener('click', async () => {
     const body = { bots: +$('#evBots').value, gens: +$('#evGens').value,
                    test_frac: +$('#evTest').value / 100, fitness: $('#evFit').value,
+                   hof_metric: $('#evHof').value,
                    maker_bps: +$('#evMbps').value, maker_only: $('#evMk').checked,
                    derivs: $('#evDerivs').checked,
                    seed: +$('#evSeed').value, since: $('#evSince').value.trim() };

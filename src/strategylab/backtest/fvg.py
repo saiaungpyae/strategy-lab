@@ -19,7 +19,7 @@ This module tests that claim mechanically, with no chart-reading bias:
 
 Usage:
     ./.venv/bin/python -m strategylab.backtest.fvg
-    ./.venv/bin/python -m strategylab.backtest.fvg --file data/binance_BTC-USDT_15m.csv --rr 2
+    ./.venv/bin/python -m strategylab.backtest.fvg --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv --rr 2
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from strategylab.data.paths import default_candles
 
 
 @dataclass(frozen=True)
@@ -259,7 +261,7 @@ def run_fvg_study(df: pd.DataFrame, p: FVGParams = FVGParams()):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--file", "-f", default="data/binance_BTC-USDT_15m.csv")
+    ap.add_argument("--file", "-f", default=default_candles("15m"))
     ap.add_argument("--rr", type=float, default=2.0, help="reward:risk target multiple")
     ap.add_argument("--min-atr", type=float, default=0.25, help="min gap height in ATRs")
     ap.add_argument("--fee", type=float, default=0.001)

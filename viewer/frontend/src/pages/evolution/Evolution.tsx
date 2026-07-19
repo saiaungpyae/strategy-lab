@@ -275,8 +275,17 @@ function EvoDone({ e }: { e: EvoRun }) {
   )
 }
 
+// "BTC · 15m" style suffix for run labels; omits tfs when both are in play
+export function runBadge(x: { pair?: string | null; tfs?: string[] | null }): string {
+  const parts: string[] = []
+  if (x.pair) parts.push(x.pair)
+  if (x.tfs && x.tfs.length === 1) parts.push(x.tfs[0])
+  return parts.length ? ' · ' + parts.join(' ') : ''
+}
+
 export default function Evolution() {
   const [evos, setEvos] = useState<EvoRun[]>([])
+  const [pairs, setPairs] = useState<{ pair: string; has_metrics: boolean }[]>([])
   const [running, setRunning] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [formOpen, setFormOpen] = useState(false)
@@ -288,10 +297,14 @@ export default function Evolution() {
   const selectRun = (id: string) => setParams(id ? { run: id } : {}, { replace: true })
 
   // new-evolution form
+  const [evPair, setEvPair] = useState('BTC')
+  const [evTf5, setEvTf5] = useState(true)
+  const [evTf15, setEvTf15] = useState(true)
   const [evBots, setEvBots] = useState('1500')
   const [evGens, setEvGens] = useState('6')
   const [evTest, setEvTest] = useState('20')
   const [evFit, setEvFit] = useState('sharpe')
+  const [evHof, setEvHof] = useState('fitness')
   const [evMbps, setEvMbps] = useState('1')
   const [evMk, setEvMk] = useState(false)
   const [evDerivs, setEvDerivs] = useState(false)
@@ -305,6 +318,7 @@ export default function Evolution() {
   const fetchEvos = useCallback(async () => {
     const j = await getJSON<EvosPayload>('/api/swarm/evos')
     setEvos(j.evos || [])
+    setPairs(j.pairs || [])
     setRunning(!!j.running)
     setLoaded(true)
     setStarting(false)
@@ -322,11 +336,18 @@ export default function Evolution() {
   }, [evos, running, starting, fetchEvos])
 
   const startEvolution = async () => {
+    if (!evTf5 && !evTf15) {
+      alert('pick at least one timeframe')
+      return
+    }
     const body = {
+      pair: evPair,
+      tfs: [evTf5 && '5m', evTf15 && '15m'].filter(Boolean).join(','),
       bots: +evBots,
       gens: +evGens,
       test_frac: +evTest / 100,
       fitness: evFit,
+      hof_metric: evHof,
       maker_bps: +evMbps,
       maker_only: evMk,
       derivs: evDerivs,
@@ -356,6 +377,7 @@ export default function Evolution() {
             evos.map((x) => (
               <option key={x.run_id} value={x.run_id}>
                 {x.run_id}
+                {runBadge(x)}
                 {x.done
                   ? ` · ${x.fitness || 'sharpe'}`
                   : ` · ⏳ ${Math.round((x.frac || 0) * 100)}%`}
@@ -379,6 +401,25 @@ export default function Evolution() {
         </Link>
       </div>
       <div className={'top newrun' + (formOpen ? ' open' : '')}>
+        <label title="asset — resolves candles (and metrics/funding when OI+funding is on) by naming convention">
+          pair{' '}
+          <select value={evPair} onChange={(ev) => setEvPair(ev.target.value)}>
+            {(pairs.length ? pairs : [{ pair: 'BTC', has_metrics: true }]).map((p) => (
+              <option key={p.pair} value={p.pair}>
+                {p.pair}
+                {p.has_metrics ? '' : ' (no metrics)'}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label title="timeframes the gene pool may use — dropping 5m skips its feature pass and roughly halves eval cost">
+          <input type="checkbox" checked={evTf5} onChange={(ev) => setEvTf5(ev.target.checked)} />{' '}
+          5m
+        </label>
+        <label>
+          <input type="checkbox" checked={evTf15} onChange={(ev) => setEvTf15(ev.target.checked)} />{' '}
+          15m
+        </label>
         <label>
           bots{' '}
           <input type="number" min={100} max={200000} style={{ width: 80 }} value={evBots} onChange={(ev) => setEvBots(ev.target.value)} />
@@ -391,11 +432,19 @@ export default function Evolution() {
           test %{' '}
           <input type="number" min={5} max={50} style={{ width: 60 }} value={evTest} onChange={(ev) => setEvTest(ev.target.value)} />
         </label>
-        <label>
+        <label title="sharpe = risk-adjusted · return = raw return with a participation floor · balanced = mean of up-day and down-day Sharpe (experimental — underperformed in the 2026-07 fitness experiments)">
           fitness{' '}
           <select value={evFit} onChange={(ev) => setEvFit(ev.target.value)}>
             <option value="sharpe">sharpe</option>
             <option value="return">return</option>
+            <option value="balanced">balanced</option>
+          </select>
+        </label>
+        <label title="what admits bots to the hall of fame — 'sharpe' keeps regime-riders out of the HOF when breeding on another fitness (the validated hybrid: fitness=return + HOF by sharpe)">
+          HOF by{' '}
+          <select value={evHof} onChange={(ev) => setEvHof(ev.target.value)}>
+            <option value="fitness">fitness</option>
+            <option value="sharpe">sharpe</option>
           </select>
         </label>
         <label>
@@ -414,9 +463,9 @@ export default function Evolution() {
           seed{' '}
           <input type="number" style={{ width: 70 }} value={evSeed} onChange={(ev) => setEvSeed(ev.target.value)} />
         </label>
-        <label>
+        <label title="training span start — 'auto' starts where the pair's metrics coverage begins (needs OI+funding)">
           since{' '}
-          <input placeholder="2021-01-01" style={{ width: 100 }} value={evSince} onChange={(ev) => setEvSince(ev.target.value)} />
+          <input placeholder="2021-01-01 | auto" style={{ width: 100 }} value={evSince} onChange={(ev) => setEvSince(ev.target.value)} />
         </label>
         <button className="primary" onClick={startEvolution}>
           Start evolution

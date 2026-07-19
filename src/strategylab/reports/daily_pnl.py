@@ -11,7 +11,7 @@ worst day, best day, and how many days had no trade at all.
 
 Usage:
     ./.venv/bin/python daily_pnl.py --strategy "zscore_z(50,2)_trend" \
-        --file data/binance_BTC-USDT_15m.csv --capital 3000 --target 1 --cost-bps 1
+        --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv --capital 3000 --target 1 --cost-bps 1
 """
 from __future__ import annotations
 
@@ -23,12 +23,13 @@ import numpy as np
 import pandas as pd
 
 from strategylab.core import Indicators
+from strategylab.data.paths import default_candles
 from strategylab.strategies.scalp import build_scalps, run_scalp
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_15m.csv")
+    p.add_argument("--file", "-f", default=default_candles("15m"))
     p.add_argument("--strategy", default="zscore_z(50,2)_trend")
     p.add_argument("--capital", type=float, default=3000.0)
     p.add_argument("--target", type=float, default=1.0, help="Daily $ goal to test against")

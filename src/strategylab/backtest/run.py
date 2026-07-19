@@ -13,7 +13,7 @@ Examples
   python run_backtest.py
 
   # A specific file and just two strategies
-  python run_backtest.py --file data/binance_BTC-USDT_15m.csv -s supertrend ema_cross
+  python run_backtest.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv -s supertrend ema_cross
 
   # Higher fees, and save an interactive chart of the best run
   python run_backtest.py --commission 0.0015 --plot supertrend
@@ -29,6 +29,7 @@ from pathlib import Path
 import pandas as pd
 from backtesting import Backtest
 
+from strategylab.data.paths import default_candles
 from strategylab.strategies.community import STRATEGIES
 
 warnings.filterwarnings("ignore")  # backtesting emits noisy user-warnings on some stats
@@ -53,7 +54,7 @@ def run_one(df, strat_cls, commission):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_1h.csv", help="OHLCV CSV to test on")
+    p.add_argument("--file", "-f", default=default_candles("1h"), help="OHLCV CSV to test on")
     p.add_argument("--strategy", "-s", nargs="+", default=["all"],
                    help=f"Which strategies to run. Options: {', '.join(STRATEGIES)} (default: all)")
     p.add_argument("--commission", "-c", type=float, default=0.001,

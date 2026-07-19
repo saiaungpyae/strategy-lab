@@ -62,6 +62,7 @@ PORT = int(os.environ.get("PORT", "8020"))
 from strategylab.core import Indicators, supertrend_dir  # noqa: E402
 from strategylab.backtest.fvg import FVGParams, run_fvg_study  # noqa: E402
 from strategylab.data.fetch import update_all  # noqa: E402
+from strategylab.data.paths import locate  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -121,11 +122,13 @@ def list_datasets() -> list[dict]:
     out = []
     if not DATA_DIR.exists():
         return out
-    for p in sorted(DATA_DIR.glob("*.csv")):
+    # canonical per-pair layout plus any legacy flat files at the root
+    files = sorted(DATA_DIR.glob("ohlcv/*/*.csv")) + sorted(DATA_DIR.glob("*.csv"))
+    for p in files:
         m = re.match(r"(.+?)_(.+?)_([0-9]+[smhdwM])\.csv$", p.name)
         exchange, symbol, tf = (m.groups() if m else ("", p.stem, ""))
         out.append({
-            "file": p.name,
+            "file": str(p.relative_to(DATA_DIR)),
             "exchange": exchange,
             "symbol": symbol.replace("-", "/"),
             "timeframe": tf,
@@ -140,8 +143,13 @@ def safe_data_path(filename: str) -> Path | None:
     if not filename:
         return None
     candidate = (DATA_DIR / filename).resolve()
-    if not candidate.is_relative_to(DATA_DIR.resolve()) or not candidate.is_file():
+    if not candidate.is_relative_to(DATA_DIR.resolve()):
         return None
+    if not candidate.is_file():
+        # pre-layout-change bookmarks name files by their old flat location
+        candidate = locate(candidate).resolve()
+        if not candidate.is_relative_to(DATA_DIR.resolve()) or not candidate.is_file():
+            return None
     return candidate
 
 
@@ -626,6 +634,37 @@ def _swarm_tables(run_dir: str, mtime: float):
             z["daily"], [str(x) for x in z["days"]], int(z["split_day"]))
 
 
+def _derive_pair(e: dict) -> str | None:
+    """Pair for runs that predate the meta field, from their data paths."""
+    import re as _re
+    for p in ([x.get("path") for x in e.get("data") or []]
+              + [e.get("metrics"), e.get("funding")]):
+        if not p:
+            continue
+        m = _re.search(r"binance_([A-Z0-9]+)-USDT_|([A-Z0-9]+)USDT_metrics|"
+                       r"([A-Z0-9]+)-USDT-USDT_funding", str(Path(p).name))
+        if m:
+            return next(g for g in m.groups() if g)
+    return None
+
+
+def _list_pairs() -> list[dict]:
+    """Pairs available for evolution: symbols with both candle tapes on disk,
+    plus whether their derivatives metrics exist."""
+    pairs: dict[str, dict] = {}
+    tapes = (sorted(DATA_DIR.glob("ohlcv/*/binance_*-USDT_15m.csv"))
+             + sorted(DATA_DIR.glob("binance_*-USDT_15m.csv")))  # legacy flat
+    for f in tapes:
+        sym = f.name.split("_")[1].split("-")[0]
+        if sym in pairs or not (f.parent / f"binance_{sym}-USDT_5m.csv").is_file():
+            continue
+        mname = f"{sym}USDT_metrics.csv"
+        has_m = any((DATA_DIR / "metrics" / d / mname).is_file()
+                    for d in (f"{sym}-USDT", ""))
+        pairs[sym] = {"pair": sym, "has_metrics": has_m}
+    return list(pairs.values())
+
+
 def swarm_evos_payload() -> dict:
     """Evolution runs: finished ones (evolution.json + top hall-of-fame rows)
     and in-flight ones (live progress.json written after every sim chunk)."""
@@ -637,6 +676,8 @@ def swarm_evos_payload() -> dict:
             if (d / "evolution.json").is_file():
                 e = _read_json(d / "evolution.json") or {}
                 e["done"] = True
+                if not e.get("pair"):
+                    e["pair"] = _derive_pair(e)
                 hof_csv = d / "hof_test.csv"
                 if hof_csv.is_file():
                     import csv
@@ -654,7 +695,7 @@ def swarm_evos_payload() -> dict:
                 p["age_s"] = round(time.time() - (d / "progress.json").stat().st_mtime, 1)
                 evos.append(p)
     running = _evolve_proc is not None and _evolve_proc.poll() is None
-    return {"evos": evos, "running": running}
+    return {"evos": evos, "running": running, "pairs": _list_pairs()}
 
 
 @lru_cache(maxsize=4)
@@ -685,9 +726,11 @@ def _hof_csv_rows(d: Path) -> list[dict]:
 
 
 def evo_bots_payload(run_id: str) -> dict:
-    """All hall-of-fame bots of one evolution run, ranked by final holdings
-    (fallback runs without history rank by test Sharpe). The viewer sorts and
-    paginates client-side — the whole hall of fame is small."""
+    """All hall-of-fame bots of one evolution run, ranked by test Sharpe —
+    the out-of-sample, risk-adjusted readout. (Holdings compounds through each
+    bot's in-sample born window, and born-window results measure ~zero
+    predictive of test performance, so it makes a poor ranking.) The viewer
+    sorts and paginates client-side — the whole hall of fame is small."""
     d = safe_swarm_dir(run_id)
     if d is None or not (d / "evolution.json").is_file():
         return {"error": "run not found"}
@@ -703,7 +746,7 @@ def evo_bots_payload(run_id: str) -> dict:
         for r in h.get("bots", []):
             b = {k: r.get(k) for k in
                  ("bot_id", "born_gen", "rules", "tf", "session", "dir_bias",
-                  "risk_pct", "test_sharpe", "test_trades")}
+                  "risk_pct", "oos_sharpe", "test_sharpe", "test_trades")}
             b["test_ret_pct"] = (r.get("test") or {}).get("ret_pct")
             b["gen_sharpes"] = [p.get("sharpe") for p in r.get("gen_perf", [])]
             # $start_cap compounded through every window, then the test span
@@ -717,8 +760,8 @@ def evo_bots_payload(run_id: str) -> dict:
                 m *= r["eq_test"][-1]
             b["final_usd"] = round(start_cap * m, 2)
             bots.append(b)
-        bots.sort(key=lambda b: (b["final_usd"] is None,
-                                 -(b["final_usd"] or 0.0)))
+        bots.sort(key=lambda b: (b["test_sharpe"] is None,
+                                 -(b["test_sharpe"] or 0.0)))
         return {**meta, "has_history": True, "n_hof": len(bots),
                 "start_capital": start_cap,
                 "windows": [w.get("span") for w in h.get("windows", [])],
@@ -740,6 +783,7 @@ def evo_bot_payload(run_id: str, bot_id: int) -> dict:
     e = _read_json(d / "evolution.json") or {}
     ft = e.get("final_test") or {}
     ctx = {"gens": e.get("gens"),
+           "pair": e.get("pair") or _derive_pair(e),
            "placebo_max": (ft.get("placebo") or {}).get("max_sharpe"),
            "fresh_max": (ft.get("fresh_random") or {}).get("max_sharpe")}
     hp = d / "hof_history.json"
@@ -772,6 +816,9 @@ def _resolve_repo_path(p: str | None) -> Path | None:
     path = Path(p)
     if not path.is_absolute():
         path = HERE.parent / path
+    if not path.is_file():
+        # stored provenance may predate the per-pair data layout
+        path = locate(path)
     return path if path.is_file() else None
 
 
@@ -1062,14 +1109,36 @@ def start_evolve(params: dict) -> dict:
             return {"started": False,
                     "error": f"bots must be between 100 and 200000 (got {bots})"}
         fitness = str(params.get("fitness") or "sharpe")
-        if fitness not in ("sharpe", "return"):
+        if fitness not in ("sharpe", "return", "balanced"):
             return {"started": False, "error": "bad fitness"}
+        hof_metric = str(params.get("hof_metric") or "fitness")
+        if hof_metric not in ("fitness", "sharpe"):
+            return {"started": False, "error": "bad hof_metric"}
         since = str(params.get("since") or "")
-        if since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
-            return {"started": False, "error": "bad since date"}
+        if since and since != "auto" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+            return {"started": False, "error": "bad since date (YYYY-MM-DD or auto)"}
+        pair = str(params.get("pair") or "BTC").upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,10}", pair):
+            return {"started": False, "error": "bad pair"}
+        # validate the pair's data exists exactly as the evolve CLI will
+        # resolve it (per-pair canonical layout or legacy flat, either works)
+        from strategylab.swarm.run import resolve_pair
+        try:
+            resolve_pair(pair, root=str(DATA_DIR),
+                         derivs=bool(params.get("derivs")))
+        except SystemExit as e:
+            return {"started": False, "error": str(e)}
+        tfs = str(params.get("tfs") or "5m,15m")
+        tf_list = [t.strip() for t in tfs.split(",") if t.strip()]
+        if not tf_list or any(t not in ("5m", "15m") for t in tf_list):
+            return {"started": False, "error": "tfs must be a subset of 5m,15m"}
+        if since == "auto" and not params.get("derivs"):
+            return {"started": False, "error": "since=auto needs OI+funding enabled"}
         cmd = [sys.executable, "-m", "strategylab.swarm.run", "evolve",
+               "--pair", pair, "--tfs", ",".join(tf_list),
                "--bots", str(bots), "--gens", str(gens),
                "--test-frac", str(test_frac), "--fitness", fitness,
+               "--hof-metric", hof_metric,
                "--min-expo", str(min_expo), "--seed", str(seed),
                "--maker-bps", str(maker_bps), "--taker-bps", str(taker_bps)]
         if since:
@@ -1078,15 +1147,9 @@ def start_evolve(params: dict) -> dict:
             cmd += ["--maker-only"]
         if params.get("derivs"):
             # derivatives features (OI, long/short ratios) + funding, which is
-            # both a perception feature and a per-settlement holding cost
-            metrics = DATA_DIR / "metrics" / "BTCUSDT_metrics.csv"
-            funding = DATA_DIR / "metrics" / "BTC-USDT-USDT_funding.csv"
-            missing = [p.name for p in (metrics, funding) if not p.is_file()]
-            if missing:
-                return {"started": False, "error":
-                        f"missing {', '.join(missing)} — run sl-swarm "
-                        "fetch-metrics / fetch-funding first"}
-            cmd += ["--metrics", str(metrics), "--funding", str(funding)]
+            # both a perception feature and a per-settlement holding cost —
+            # existence already validated by resolve_pair above
+            cmd += ["--derivs"]
         SWARM_DIR.mkdir(parents=True, exist_ok=True)
         log = open(SWARM_DIR / "last_evolve.log", "w")
         _evolve_proc = subprocess.Popen(cmd, cwd=str(HERE.parent),

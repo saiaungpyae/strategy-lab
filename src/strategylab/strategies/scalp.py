@@ -20,8 +20,8 @@ Execution model (maker, liquidity-provider style):
     standard fix for 'catching a falling knife' in downtrends.
 
 Usage:
-    ./.venv/bin/python scalp_lab.py --file data/binance_BTC-USDT_5m.csv
-    ./.venv/bin/python scalp_lab.py --file data/binance_BTC-USDT_15m.csv --train 0.7
+    ./.venv/bin/python scalp_lab.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_5m.csv
+    ./.venv/bin/python scalp_lab.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv --train 0.7
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from strategylab.core import Indicators, PPY
+from strategylab.data.paths import default_candles
 
 BARS_PER_DAY = {"1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48,
                 "1h": 24, "2h": 12, "4h": 6, "1d": 1}
@@ -131,7 +132,7 @@ def build_scalps(ind: Indicators):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_5m.csv")
+    p.add_argument("--file", "-f", default=default_candles("5m"))
     p.add_argument("--train", type=float, default=0.7)
     p.add_argument("--taker-fee", type=float, default=0.001, help="Fee paid on stop-loss market exits")
     p.add_argument("--haircuts-bps", type=float, nargs="+", default=[0, 1, 2, 5, 10],

@@ -28,6 +28,7 @@ import pandas as pd
 from strategylab.core import Indicators, PPY
 from strategylab.reports.ema import (run_maker, run_taker, portfolio_stats, trade_stats,
                         bh, fmt_pct, TAKER_FEE, MAKER_FEE, OFFSET, MAX_WAIT)
+from strategylab.data.paths import default_candles
 
 
 def combo_signals(ind: Indicators, ma: int, rsi_n: int, buy: float, exit_rsi: float):
@@ -51,7 +52,7 @@ RSI_N = 14
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_1h.csv")
+    p.add_argument("--file", "-f", default=default_candles("1h"))
     p.add_argument("--out", default="reports/combo_sma50_rsi14_report.md")
     args = p.parse_args()
 

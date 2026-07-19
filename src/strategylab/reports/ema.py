@@ -20,7 +20,7 @@ Both execution models are reported:
 
 Run:
     ./.venv/bin/python ema_report.py
-    ./.venv/bin/python ema_report.py --file data/binance_BTC-USDT_1h.csv
+    ./.venv/bin/python ema_report.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_1h.csv
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from strategylab.core import Indicators, PPY
+from strategylab.data.paths import default_candles
 
 # Execution assumptions (identical to maker_backtest.py so numbers reconcile).
 TAKER_FEE = 0.001      # 0.10% per side, market orders
@@ -189,7 +190,7 @@ def fmt_pct(x):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_1h.csv")
+    p.add_argument("--file", "-f", default=default_candles("1h"))
     p.add_argument("--kind", choices=["ema", "sma"], default=KIND, help="moving-average family")
     p.add_argument("--fast", type=int, default=FAST, help="fast MA length")
     p.add_argument("--slow", type=int, default=SLOW, help="slow MA length")

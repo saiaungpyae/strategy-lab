@@ -21,7 +21,7 @@ out-of-sample window vs the 0.03%/day target.
 
 Usage:
     ./.venv/bin/python regime_lab.py
-    ./.venv/bin/python regime_lab.py --file data/binance_BTC-USDT_5m.csv --train 0.7
+    ./.venv/bin/python regime_lab.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_5m.csv --train 0.7
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from strategylab.core import Indicators
+from strategylab.data.paths import default_candles
 from strategylab.strategies.scalp import BARS_PER_DAY
 
 DAILY_TARGET = 0.0003  # 0.03%/day
@@ -169,7 +170,7 @@ def build_variants(ind: Indicators, df: pd.DataFrame, bpd: int):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_15m.csv")
+    p.add_argument("--file", "-f", default=default_candles("15m"))
     p.add_argument("--train", type=float, default=0.7)
     p.add_argument("--taker-fee", type=float, default=0.001)
     p.add_argument("--target-pct", type=float, default=0.004, help="Take-profit above entry")

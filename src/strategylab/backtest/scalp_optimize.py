@@ -11,8 +11,8 @@ This is the definitive test of "can I scalp with my zero-fee edge?": no rigged
 reward:risk, no peeking at the test set, cost baked in from the start.
 
 Usage:
-    ./.venv/bin/python scalp_optimize.py --file data/binance_BTC-USDT_15m.csv
-    ./.venv/bin/python scalp_optimize.py --file data/binance_BTC-USDT_5m.csv --cost-bps 2
+    ./.venv/bin/python scalp_optimize.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv
+    ./.venv/bin/python scalp_optimize.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_5m.csv --cost-bps 2
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import pandas as pd
 
 from strategylab.core import Indicators, PPY
 from strategylab.strategies.scalp import run_scalp, metrics, BARS_PER_DAY
+from strategylab.data.paths import default_candles
 
 
 def entry_families(ind: Indicators):
@@ -54,7 +55,7 @@ def evaluate(o, h, lo, c, level, mean, target, stop, use_mean, max_hold, cost_bp
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_15m.csv")
+    p.add_argument("--file", "-f", default=default_candles("15m"))
     p.add_argument("--train", type=float, default=0.7)
     p.add_argument("--cost-bps", type=float, default=2.0, help="Realistic per-fill cost for ranking (default 2 bps)")
     p.add_argument("--taker-fee", type=float, default=0.001)

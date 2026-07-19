@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from . import engine, features, genome
 
@@ -78,6 +79,8 @@ def _evaluate_many(pops, w5, w15, cfg, n_days, pool, on_progress=None):
     tasks = []
     for j, pop in enumerate(pops):
         for tf, w in ((0, w5), (1, w15)):
+            if w is None:  # timeframe excluded from this run (--tfs)
+                continue
             idx = np.flatnonzero(pop.tf == tf)
             for i in range(0, len(idx), CHUNK):
                 pos = idx[i:i + CHUNK]
@@ -172,24 +175,78 @@ def _fitness(out, d0, d1, start_cap, mode="sharpe", min_expo=0.15, day_up=None):
     return fit, sh, trades
 
 
-def _next_gen(pop, fit, n_feat, rng, maker_only, random_selection, fresh_seed):
+def _next_gen(pop, fit, n_feat, rng, maker_only, random_selection, fresh_seed,
+              allowed_tfs=None):
     n = pop.n
     order = rng.permutation(n) if random_selection else np.argsort(-fit)
     elites = genome.subset(pop, order[:max(1, int(n * ELITE_FRAC))])
     parents = order[:max(2, int(n * PARENT_FRAC))]
     n_fresh = int(n * FRESH_FRAC)
     n_off = n - elites.n - n_fresh
-    offspring = genome.breed(pop, parents, n_off, n_feat, rng, maker_only)
+    offspring = genome.breed(pop, parents, n_off, n_feat, rng, maker_only,
+                             allowed_tfs=allowed_tfs)
     fresh = genome.sample(n_fresh, n_feat, pop.feature_names, 0.0, fresh_seed,
-                          maker_only=maker_only)
+                          maker_only=maker_only, allowed_tfs=allowed_tfs)
     return genome.concat([elites, offspring, fresh])
 
 
 def cmd_evolve(args) -> None:
     from .run import _load, _market  # lazy: avoids circular import
 
+    from .run import DEF_FILE5, DEF_FILE15, TFS, check_symbols, resolve_pair
+
     t_start = time.time()
-    run_id = "evo-" + datetime.now().strftime("%Y%m%d-%H%M%S") + f"-s{args.seed}"
+
+    # --- pair / timeframe resolution -------------------------------------
+    pair = (getattr(args, "pair", None) or "").upper() or None
+    if pair:
+        explicit = (args.file5 != DEF_FILE5 or args.file15 != DEF_FILE15
+                    or args.metrics or args.funding)
+        if explicit:
+            raise SystemExit("--pair and explicit --file5/--file15/--metrics/"
+                             "--funding are mutually exclusive")
+        args.file5, args.file15, args.metrics, args.funding = resolve_pair(
+            pair, getattr(args, "data_root", "data"),
+            derivs=bool(getattr(args, "derivs", False)))
+    # candles/metrics/funding must agree on the asset even without --pair —
+    # a mixed set merges on timestamp and silently produces garbage features
+    pair = check_symbols(args.file5, args.file15, args.metrics,
+                         args.funding) or pair
+
+    tf_names = [t.strip() for t in
+                (getattr(args, "tfs", None) or "5m,15m").split(",") if t.strip()]
+    bad = [t for t in tf_names if t not in TFS]
+    if bad or not tf_names:
+        raise SystemExit(f"--tfs must be a non-empty subset of {list(TFS)} "
+                         f"(got {bad or 'nothing'})")
+    tf_codes = sorted(TFS[t] for t in dict.fromkeys(tf_names))
+    tf_names = [n for n, c in TFS.items() if c in tf_codes]
+    need5, need15 = 0 in tf_codes, 1 in tf_codes
+
+    # metrics coverage: warn (or with --since auto, start) where the pair's
+    # derivative data actually begins, so early windows don't grade a
+    # crippled half-genome (the BNB-before-2021-12 failure mode)
+    coverage = None
+    if args.metrics:
+        m0 = pd.read_csv(args.metrics, nrows=1)
+        f0 = pd.read_csv(args.funding, nrows=1) if args.funding else None
+        starts = [pd.to_datetime(int(m0.iloc[0, 0]), unit="ms")]
+        if f0 is not None:
+            starts.append(pd.to_datetime(int(f0.iloc[0, 0]), unit="ms"))
+        coverage = max(starts).strftime("%Y-%m-%d")
+    if args.since == "auto":
+        if coverage is None:
+            raise SystemExit("--since auto needs metrics/funding "
+                             "(pass --derivs or --metrics/--funding)")
+        args.since = coverage
+        print(f"--since auto -> {coverage} (metrics coverage start)")
+    elif coverage and args.since < coverage:
+        print(f"⚠ metrics for {pair or '?'} only cover {coverage} onward but "
+              f"--since is {args.since}: derivative rules are dead weight on "
+              f"earlier windows (consider --since auto)")
+
+    run_id = ("evo-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+              + f"-s{args.seed}" + (f"-{pair}" if getattr(args, "pair", None) else ""))
     run_dir = Path(args.out) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -204,7 +261,8 @@ def cmd_evolve(args) -> None:
             "fitness": args.fitness, "maker_only": bool(args.maker_only),
             "taker_bps": args.taker_bps, "maker_bps": args.maker_bps,
             "since": args.since, "hof_per_gen": hof_n,
-            "hof_metric": hof_metric,
+            "hof_metric": hof_metric, "pair": pair, "tfs": tf_names,
+            "metrics_coverage": coverage,
             "metrics": args.metrics, "funding": args.funding}
     gen_stats = []
 
@@ -231,8 +289,20 @@ def cmd_evolve(args) -> None:
         df5["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]"),
         df15["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]"))
     qs = np.linspace(0.02, 0.98, 49)
-    mkt5, names = _market(df5, 0, 288, ts_max + 1, all_days, qs)   # split unused here
-    mkt15, _ = _market(df15, 1, 96, ts_max + 1, all_days, qs)
+    # excluded timeframes skip the (expensive) feature pass — their tape is
+    # still loaded for the day grid, daily closes and provenance
+    names = None
+    if need5:
+        mkt5, names = _market(df5, 0, 288, ts_max + 1, all_days, qs)  # split unused here
+    else:
+        bd5 = df5["dt"].dt.tz_convert(None).dt.floor("D").to_numpy().astype("datetime64[D]")
+        mkt5 = {"c": df5["close"].to_numpy(np.float64),
+                "day_pos": np.searchsorted(all_days, bd5).astype(np.int64)}
+    if need15:
+        mkt15, names15 = _market(df15, 1, 96, ts_max + 1, all_days, qs)
+        names = names or names15
+    else:
+        mkt15 = None
     n_feat = len(names)
 
     # underlying daily direction (for 'balanced' fitness and the regime slice)
@@ -264,10 +334,11 @@ def cmd_evolve(args) -> None:
     else:
         pool = ProcessPoolExecutor(max_workers=n_jobs)
 
+    allowed = tf_codes if tf_codes != [0, 1] else None  # None = legacy RNG path
     evolved = genome.sample(args.bots, n_feat, names, 0.0, args.seed,
-                            maker_only=args.maker_only)
+                            maker_only=args.maker_only, allowed_tfs=allowed)
     placebo = genome.sample(args.bots, n_feat, names, 0.0, args.seed + 1000,
-                            maker_only=args.maker_only)
+                            maker_only=args.maker_only, allowed_tfs=allowed)
     rng_e = np.random.default_rng(args.seed * 31 + 1)
     rng_p = np.random.default_rng(args.seed * 31 + 2)
     hof = []
@@ -277,10 +348,10 @@ def cmd_evolve(args) -> None:
           f"{np.datetime64(int(test_t0), 'ms').astype('datetime64[D]')}")
     for gen in range(args.gens):
         t0, t1 = int(bounds[gen]), int(bounds[gen + 1])
-        w5, i0_5, _ = _window(mkt5, ts5, t0, t1, qs)
-        w15, _, _ = _window(mkt15, ts15, t0, t1, qs)
-        d0 = int(mkt5["day_pos"][i0_5])
-        d1 = int(w5["day_pos"][-1]) + 1
+        w5 = _window(mkt5, ts5, t0, t1, qs)[0] if need5 else None
+        w15 = _window(mkt15, ts15, t0, t1, qs)[0] if need15 else None
+        d0 = int(mkt5["day_pos"][int(np.searchsorted(ts5, t0))])
+        d1 = int((w5 or w15)["day_pos"][-1]) + 1
         row = {"gen": gen, "window": [str(np.datetime64(t0, 'ms').astype('datetime64[D]')),
                                       str(np.datetime64(t1, 'ms').astype('datetime64[D]'))]}
         fits = {}
@@ -317,16 +388,19 @@ def cmd_evolve(args) -> None:
               f"({time.time() - t_start:.0f}s)")
         if gen < args.gens - 1:
             evolved = _next_gen(evolved, fits["evolved"], n_feat, rng_e,
-                                args.maker_only, False, args.seed * 100 + gen)
+                                args.maker_only, False, args.seed * 100 + gen,
+                                allowed_tfs=allowed)
             placebo = _next_gen(placebo, fits["placebo"], n_feat, rng_p,
-                                args.maker_only, True, args.seed * 200 + gen)
+                                args.maker_only, True, args.seed * 200 + gen,
+                                allowed_tfs=allowed)
 
     # ---- reserved test span ---------------------------------------------
-    w5t, i0t, _ = _window(mkt5, ts5, test_t0, ts_max + 1, qs)
-    w15t, _, _ = _window(mkt15, ts15, test_t0, ts_max + 1, qs)
+    w5t = _window(mkt5, ts5, test_t0, ts_max + 1, qs)[0] if need5 else None
+    w15t = _window(mkt15, ts15, test_t0, ts_max + 1, qs)[0] if need15 else None
+    i0t = int(np.searchsorted(ts5, test_t0))
     d0t, d1t = int(mkt5["day_pos"][i0t]), len(all_days)
     fresh = genome.sample(args.bots, n_feat, names, 0.0, args.seed + 5000,
-                          maker_only=args.maker_only)
+                          maker_only=args.maker_only, allowed_tfs=allowed)
     hof_pop = genome.concat(hof)
     final = {}
     cohorts = (("evolved", evolved), ("placebo", placebo),
@@ -423,10 +497,10 @@ def cmd_evolve(args) -> None:
     hist_windows, per_win = [], []
     for gen in range(args.gens):
         t0, t1 = int(bounds[gen]), int(bounds[gen + 1])
-        w5, i0_5, _ = _window(mkt5, ts5, t0, t1, qs)
-        w15, _, _ = _window(mkt15, ts15, t0, t1, qs)
-        d0 = int(mkt5["day_pos"][i0_5])
-        d1 = int(w5["day_pos"][-1]) + 1
+        w5 = _window(mkt5, ts5, t0, t1, qs)[0] if need5 else None
+        w15 = _window(mkt15, ts15, t0, t1, qs)[0] if need15 else None
+        d0 = int(mkt5["day_pos"][int(np.searchsorted(ts5, t0))])
+        d1 = int((w5 or w15)["day_pos"][-1]) + 1
         out = _evaluate_many(
             [hof_pop], w5, w15, cfg, len(all_days), pool,
             on_progress=lambda fr, g=gen: prog(
@@ -517,6 +591,7 @@ def cmd_evolve(args) -> None:
               "test_start": str(np.datetime64(int(test_t0), 'ms')),
               "maker_only": bool(args.maker_only), "taker_bps": args.taker_bps,
               "maker_bps": args.maker_bps, "since": args.since,
+              "pair": pair, "tfs": tf_names, "metrics_coverage": coverage,
               "metrics": args.metrics, "funding": args.funding,
               "hof_per_gen": hof_n, "hof_metric": hof_metric,
               "data": meta["data"],

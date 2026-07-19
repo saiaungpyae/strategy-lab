@@ -21,6 +21,7 @@ import pandas as pd
 
 from . import engine, features, genome
 from .evolve import _alloc, _fill_eq
+from ..data import paths as datapaths
 
 # ---- FROZEN SPEC (2026-07-19) — do not edit; supersede via a new file ------
 TRACK_START = np.datetime64("2026-07-19")  # data at/after this date is forward OOS
@@ -192,9 +193,9 @@ def cmd_track(args) -> None:
 
 def add_parser(sub) -> None:
     t = sub.add_parser("track", help="rescore the pre-registered top_ls configs (forward OOS)")
-    t.add_argument("--file15", default="data/binance_BTC-USDT_15m.csv")
-    t.add_argument("--metrics", default="data/metrics/BTCUSDT_metrics.csv")
-    t.add_argument("--funding", default="data/metrics/BTC-USDT-USDT_funding.csv")
+    t.add_argument("--file15", default=datapaths.default_candles("15m"))
+    t.add_argument("--metrics", default=datapaths.default_metrics())
+    t.add_argument("--funding", default=datapaths.default_funding())
     t.add_argument("--taker-bps", type=float, default=5.0)
     t.add_argument("--maker-bps", type=float, default=1.0)
     t.add_argument("--out", default="reports/tracking")

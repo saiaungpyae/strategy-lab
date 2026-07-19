@@ -12,6 +12,7 @@ import {
 import { C } from '../../lib/colors'
 import { getJSON } from '../../lib/api'
 import { fmt, money } from '../../lib/format'
+import { runBadge } from './Evolution'
 import type { EvoBotSummary, EvoBotsPayload, EvosPayload } from '../../types'
 
 const PAGE = 25
@@ -60,9 +61,11 @@ const v = (x: number | string | null | undefined, d = 2) =>
 const col = createColumnHelper<EvoBotSummary>()
 
 export default function EvoBots() {
-  const [evos, setEvos] = useState<{ run_id: string; done: boolean }[]>([])
+  const [evos, setEvos] = useState<
+    { run_id: string; done: boolean; pair?: string | null; tfs?: string[] | null }[]
+  >([])
   const [data, setData] = useState<EvoBotsPayload | null>(null)
-  const [sorting, setSorting] = useState<SortingState>([{ id: 'final_usd', desc: true }])
+  const [sorting, setSorting] = useState<SortingState>([{ id: 'test_sharpe', desc: true }])
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: PAGE })
   const [params, setParams] = useSearchParams()
   const nav = useNavigate()
@@ -89,7 +92,7 @@ export default function EvoBots() {
     getJSON<EvoBotsPayload>(`/api/swarm/evo/bots?id=${encodeURIComponent(run)}`)
       .then((j) => {
         setData(j)
-        setSorting([{ id: j.has_history ? 'final_usd' : 'test_sharpe', desc: true }])
+        setSorting([{ id: 'test_sharpe', desc: true }])
         setPagination((p) => ({ ...p, pageIndex: 0 }))
       })
       .catch(() =>
@@ -128,6 +131,12 @@ export default function EvoBots() {
                 return gs ? <Spark v={gs} /> : '—'
               },
               meta: { className: 'l' },
+            }),
+            col.accessor((r) => (r.oos_sharpe == null ? undefined : +r.oos_sharpe), {
+              id: 'oos_sharpe',
+              header: 'OOS S',
+              sortUndefined: 'last' as const,
+              cell: (info) => v(info.row.original.oos_sharpe),
             }),
           ]
         : []),
@@ -233,6 +242,7 @@ export default function EvoBots() {
             evos.map((x) => (
               <option key={x.run_id} value={x.run_id}>
                 {x.run_id}
+                {runBadge(x)}
               </option>
             ))
           ) : (
@@ -256,7 +266,9 @@ export default function EvoBots() {
             >
               <h3 style={{ margin: 0 }}>
                 {data.n_hof} hall-of-fame bots
-                {hasHistory ? ` · ranked by holdings (${money(startCap)} at the start)` : ' · ranked by test Sharpe'}
+                {hasHistory
+                  ? ` · ranked by test Sharpe · OOS S = mean Sharpe on windows after birth (the validated selection signal) · holdings = ${money(startCap)} compounded through every window`
+                  : ' · ranked by test Sharpe'}
               </h3>
               <span className="muted" style={{ flex: 1 }}>
                 {data.gens ? `${data.gens} windows` : ''}

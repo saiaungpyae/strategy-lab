@@ -13,7 +13,7 @@ unlock the order-flow features in the swarm feature pool.
 
 Examples
 --------
-  # 1 year of BTC/USDT hourly candles from Binance -> data/binance_BTC-USDT_1h.csv
+  # 1 year of BTC/USDT hourly candles from Binance -> data/ohlcv/BTC-USDT/binance_BTC-USDT_1h.csv
   python fetch_ohlcv.py --symbol BTC/USDT --timeframe 1h --since 2024-01-01
 
   # Several pairs at once, 15m candles, save as Parquet
@@ -34,6 +34,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import paths
 
 try:
     import ccxt
@@ -179,14 +181,13 @@ def fetch_symbol(
 
 
 def save(df: "pd.DataFrame", out_dir: Path, exchange_name: str, symbol: str, timeframe: str, fmt: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
     safe_symbol = symbol.replace("/", "-").replace(":", "-")
-    stem = f"{exchange_name}_{safe_symbol}_{timeframe}"
+    path = paths.candles(safe_symbol, timeframe, exchange_name,
+                         root=out_dir).with_suffix(f".{fmt}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "parquet":
-        path = out_dir / f"{stem}.parquet"
         df.to_parquet(path, index=False)
     else:
-        path = out_dir / f"{stem}.csv"
         df.to_csv(path, index=False)
     return path
 
@@ -271,11 +272,23 @@ def update_file(path: Path, exchange: "ccxt.Exchange | None" = None) -> dict:
 
 
 def update_all(data_dir: Path) -> list[dict]:
-    """Incrementally update every recognized dataset file in `data_dir`."""
-    paths = sorted(p for p in data_dir.glob("*") if parse_dataset_filename(p))
+    """Incrementally update every recognized dataset file under `data_dir`,
+    recursing into the per-pair ohlcv/ tree. Pinned snapshots/ stay frozen —
+    their whole point is to never change under a running comparison."""
+    targets = sorted(p for p in data_dir.rglob("*")
+                     if p.is_file() and parse_dataset_filename(p)
+                     and "snapshots" not in p.relative_to(data_dir).parts)
+    # A .parquet sharing a stem with a .csv is the swarm's transparent sidecar
+    # cache (swarm/run._load), not a primary dataset. Its `datetime` column is
+    # raw csv strings, so concatenating fetched datetime64 rows onto it yields a
+    # mixed object column that fails to serialize. Skip it: updating the csv
+    # bumps its mtime, so the swarm regenerates the sidecar on next load.
+    csv_stems = {p.with_suffix("") for p in targets if p.suffix == ".csv"}
+    targets = [p for p in targets
+               if not (p.suffix == ".parquet" and p.with_suffix("") in csv_stems)]
     exchanges: dict[str, "ccxt.Exchange"] = {}  # one instance per exchange id
     results = []
-    for p in paths:
+    for p in targets:
         name = parse_dataset_filename(p)["exchange"]
         try:
             ex = exchanges.get(name) or exchanges.setdefault(name, make_exchange(name))
@@ -321,7 +334,8 @@ def main() -> None:
                    help="End date (UTC, exclusive). Default: now.")
     p.add_argument("--format", "-f", choices=["csv", "parquet"], default="csv",
                    help="Output format (default: csv)")
-    p.add_argument("--out", "-o", default="data", help="Output directory (default: data/)")
+    p.add_argument("--out", "-o", default="data",
+                   help="Data root (default: data/); files land under <out>/ohlcv/<PAIR>/")
     p.add_argument("--list-timeframes", action="store_true",
                    help="Print the timeframes this exchange supports and exit.")
     args = p.parse_args()

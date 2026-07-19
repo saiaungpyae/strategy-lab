@@ -13,7 +13,7 @@ out-of-sample survival (good on train AND on unseen test data) means anything.
 
 Usage:
     ./.venv/bin/python strategy_lab.py                       # 1h data, default
-    ./.venv/bin/python strategy_lab.py --file data/binance_BTC-USDT_15m.csv
+    ./.venv/bin/python strategy_lab.py --file data/ohlcv/BTC-USDT/binance_BTC-USDT_15m.csv
     ./.venv/bin/python strategy_lab.py --commission 0 --train 0.7
 """
 
@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from strategylab.data.paths import default_candles
 
 # Bars per year, by timeframe — for annualizing Sharpe / CAGR.
 PPY = {"1m": 525600, "3m": 175200, "5m": 105120, "15m": 35040, "30m": 17520,
@@ -255,7 +257,7 @@ def bh_metrics(close, ppy):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", "-f", default="data/binance_BTC-USDT_1h.csv")
+    p.add_argument("--file", "-f", default=default_candles("1h"))
     p.add_argument("--commission", "-c", type=float, default=0.001)
     p.add_argument("--train", type=float, default=0.7, help="Fraction of data used for in-sample training")
     p.add_argument("--top", type=int, default=100, help="How many train-winners to validate out-of-sample")
