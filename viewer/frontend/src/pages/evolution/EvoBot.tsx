@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import CanvasBox from '../../components/CanvasBox'
+import TopNav from '../../components/TopNav'
 import { lines } from '../../lib/canvas'
 import { C } from '../../lib/colors'
 import { getJSON } from '../../lib/api'
@@ -85,12 +86,13 @@ export default function EvoBot() {
 
   return (
     <div className="swarm">
-      <div className="top">
-        <h1>
-          strategy-lab <span>/ Evolution / Bot {botId}</span>
-        </h1>
+      <TopNav />
+      <div className="toolbar">
+        <span className="crumb">
+          Evolution <span>/ Bot {botId}</span>
+        </span>
         <span className="muted">{run}</span>
-        <span style={{ flex: 1 }} />
+        <span className="spacer" />
         {data?.has_history && (
           <Link
             to={`/chart?run=${encodeURIComponent(run)}&bot=${encodeURIComponent(botId)}`}
@@ -102,7 +104,6 @@ export default function EvoBot() {
         <Link to={'/evolution/bots' + (run ? `?run=${encodeURIComponent(run)}` : '')}>
           ← top bots
         </Link>
-        <Link to={'/evolution' + (run ? `?run=${encodeURIComponent(run)}` : '')}>evolution</Link>
       </div>
       <div className="wrap">
         {!data ? (

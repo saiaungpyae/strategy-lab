@@ -18,6 +18,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import io
 import json
 import mimetypes
 import os
@@ -109,7 +110,9 @@ def refresh_status() -> dict:
 
 # Cache raw CSV loads so repeated requests / bar-count changes are instant.
 # Keyed by (path, mtime) so a re-fetched file is picked up automatically.
-@lru_cache(maxsize=16)
+# Full loads are only needed where indicator warmup wants the whole history
+# (chart-page signals/FVG); everything dashboard-facing uses tail reads below.
+@lru_cache(maxsize=8)
 def _load(path_str: str, mtime: float) -> pd.DataFrame:
     df = pd.read_csv(path_str)
     # seconds (UTC) is what lightweight-charts wants for intraday data
@@ -119,6 +122,74 @@ def _load(path_str: str, mtime: float) -> pd.DataFrame:
 
 def load_df(path: Path) -> pd.DataFrame:
     return _load(str(path), path.stat().st_mtime)
+
+
+# ----------------------------------------------------------------------------
+# Fast partial reads — the dashboard endpoints must never parse a whole tape
+# (the 5m CSVs are ~60 MB each; 64 datasets ≈ 1.4 GB per page load otherwise).
+# ----------------------------------------------------------------------------
+def _tail_bytes(path: Path, n: int) -> bytes:
+    """CSV bytes of the header + last n data rows, via seek from EOF."""
+    with open(path, "rb") as f:
+        header = f.readline()
+        start = f.tell()  # first data byte
+        f.seek(0, 2)
+        size = f.tell()
+        avail = size - start
+        want = n + 1  # newlines guaranteeing n complete rows
+        back = min(avail, max(1024, want * 140))
+        while True:
+            f.seek(size - back)
+            chunk = f.read(back)
+            if chunk.count(b"\n") >= want or back >= avail:
+                break
+            back = min(avail, back * 2)
+        if back < avail:  # drop the partial first line of the window
+            chunk = chunk[chunk.index(b"\n") + 1:]
+        rows = [ln for ln in chunk.split(b"\n") if ln.strip()]
+        return header + b"\n".join(rows[-n:]) + b"\n"
+
+
+@lru_cache(maxsize=256)
+def _tail_df(path_str: str, mtime: float, bars: int) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(_tail_bytes(Path(path_str), bars)))
+    df["time"] = (df["timestamp"] // 1000).astype("int64")
+    return df
+
+
+def tail_df(path: Path, bars: int) -> pd.DataFrame:
+    return _tail_df(str(path), path.stat().st_mtime, bars)
+
+
+@lru_cache(maxsize=256)
+def _file_stats(path_str: str, mtime: float, size: int) -> dict:
+    """Row count + first/last timestamps without parsing the CSV: a buffered
+    newline count (~50 ms per 60 MB) and two line reads at the ends. Keyed by
+    (mtime, size) so only files the fetcher touched are re-scanned."""
+    with open(path_str, "rb") as f:
+        f.readline()  # header
+        first_line = f.readline()
+        f.seek(max(0, size - 4096))
+        end_chunk = f.read()
+        f.seek(0)
+        newlines = 0
+        while True:
+            buf = f.read(1 << 20)
+            if not buf:
+                break
+            newlines += buf.count(b"\n")
+    rows = newlines - 1 + (0 if end_chunk.endswith(b"\n") else 1)
+    last_line = next(ln for ln in reversed(end_chunk.split(b"\n")) if ln.strip())
+    return {
+        "rows": max(0, rows),
+        "first": int(first_line.split(b",")[0]) // 1000,
+        "last": int(last_line.split(b",")[0]) // 1000,
+    }
+
+
+def file_stats(path: Path) -> dict:
+    st = path.stat()
+    return _file_stats(str(path), st.st_mtime, st.st_size)
 
 
 def list_datasets() -> list[dict]:
@@ -184,10 +255,14 @@ def candles_payload(filename: str, bars: int) -> dict:
     path = safe_data_path(filename)
     if path is None:
         return {"error": f"file not found: {filename}"}
-    df = load_df(path)
-    total = len(df)
+    # bounded request -> tail read (milliseconds even on the 60 MB 5m tapes);
+    # the row total comes from the cached newline count, not a full parse
     if bars > 0:
-        df = df.tail(bars)
+        total = file_stats(path)["rows"]
+        df = tail_df(path, bars)
+    else:
+        df = load_df(path)
+        total = len(df)
 
     candles = [
         {"time": int(t), "open": float(o), "high": float(h), "low": float(l), "close": float(c)}
@@ -352,24 +427,29 @@ def tf_seconds(tf: str) -> int:
 
 
 def health_payload() -> dict:
+    """Freshness/completeness of every dataset without parsing any CSV:
+    newline counts + end-line reads only (see _file_stats). `gaps` reports
+    missing bars — (expected rows from the time span) minus (actual rows)."""
     now = time.time()
     items = []
     for d in list_datasets():
         path = DATA_DIR / d["file"]
-        df = load_df(path)
+        try:
+            st = file_stats(path)
+        except Exception as e:
+            items.append({**d, "error": f"{type(e).__name__}: {e}"})
+            continue
         step = tf_seconds(d["timeframe"])
-        ts = df["time"]
-        gaps = int((ts.diff().dropna() > step).sum()) if step else 0
-        last = int(ts.iloc[-1])
-        age = now - (last + step)  # measured from when the last candle *closed*
+        age = now - (st["last"] + step)  # from when the last candle *closed*
+        expected = (st["last"] - st["first"]) // step + 1 if step else st["rows"]
         items.append({
             **d,
-            "rows": len(df),
-            "first": int(ts.iloc[0]),
-            "last": last,
+            "rows": st["rows"],
+            "first": st["first"],
+            "last": st["last"],
             "age_seconds": max(0, int(age)),
             "bars_behind": int(age // step) if step else None,
-            "gaps": gaps,
+            "gaps": max(0, int(expected - st["rows"])),
             "size_bytes": path.stat().st_size,
         })
     return {"datasets": items, "refresh": refresh_status()}
@@ -389,11 +469,11 @@ def _regime_state(regime: np.ndarray) -> dict:
     return {"state": "long" if state else "flat", "bars_since_flip": flip}
 
 
-@lru_cache(maxsize=16)
-def _snapshot_one(path_str: str, mtime: float) -> dict:
+@lru_cache(maxsize=256)
+def _snapshot_one(path_str: str, mtime: float, step: int) -> dict:
     # Tail window: enough for SMA200 warmup + a meaningful flip lookback.
-    df = pd.read_csv(path_str).tail(1500).reset_index(drop=True)
-    df["time"] = (df["timestamp"] // 1000).astype("int64")
+    # Read via seek from EOF — never the whole tape.
+    df = _tail_df(path_str, mtime, 1500)
     dfi = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
                              "close": "Close", "volume": "Volume"})
     ind = Indicators(dfi)
@@ -411,32 +491,82 @@ def _snapshot_one(path_str: str, mtime: float) -> dict:
     events, _ = run_fvg_study(df, FVGParams())
     out["fvg_open"] = sum(1 for ev in events if ev.outcome == "open")
 
+    # 24h % change from the candle ~24h before the last one
+    back = int(86400 // step) if step else 0
+    change = None
+    if back and len(df) > back:
+        prev = float(close[-1 - back])
+        change = (float(close[-1]) - prev) / prev * 100
+
     return {
         "last_close": float(close[-1]),
         "last_time": int(df["time"].iloc[-1]),
         "signals": out,
+        "change_24h_pct": change,
     }
 
 
-def snapshot_payload() -> dict:
+def snapshot_payload(symbol: str | None = None) -> dict:
+    """Signal states per dataset. `symbol` filters to one pair — either the
+    full symbol ("BTC/USDT") or the base ("BTC", matching spot + perp) — so
+    the dashboard only computes the pair it is actually showing."""
     items = []
     for d in list_datasets():
+        if symbol and d["symbol"] != symbol and d["symbol"].split("/")[0] != symbol:
+            continue
         path = DATA_DIR / d["file"]
+        step = tf_seconds(d["timeframe"])
         try:
-            snap = _snapshot_one(str(path), path.stat().st_mtime)
+            snap = _snapshot_one(str(path), path.stat().st_mtime, step)
         except Exception as e:
             items.append({**d, "error": f"{type(e).__name__}: {e}"})
             continue
-        # 24h % change from the candle ~24h before the last one
-        step = tf_seconds(d["timeframe"])
-        df = load_df(path)
-        back = int(86400 // step) if step else 0
-        change = None
-        if back and len(df) > back:
-            prev = float(df["close"].iloc[-1 - back])
-            change = (snap["last_close"] - prev) / prev * 100
-        items.append({**d, **snap, "change_24h_pct": change})
+        items.append({**d, **snap})
     return {"datasets": items}
+
+
+def overview_payload() -> dict:
+    """Per-pair market summary — last price, 24h move, 7-day sparkline —
+    from each pair's 1h tape tail (spot preferred). O(pairs), not O(files)."""
+    groups: dict[str, list[dict]] = {}
+    for d in list_datasets():
+        groups.setdefault(d["symbol"].split("/")[0], []).append(d)
+    pairs = []
+    for base in sorted(groups):
+        items = groups[base]
+        pick = next((d for d in items if d["timeframe"] == "1h"
+                     and not d["exchange"].endswith("usdm")),
+                    next((d for d in items if d["timeframe"] == "1h"), items[0]))
+        path = DATA_DIR / pick["file"]
+        step = tf_seconds(pick["timeframe"]) or 3600
+        try:
+            df = tail_df(path, 169)  # 7 days of 1h + the 24h-ago bar
+            st = file_stats(path)
+        except Exception as e:
+            pairs.append({"pair": base, "error": f"{type(e).__name__}: {e}"})
+            continue
+        closes = df["close"].to_numpy(float)
+        last = float(closes[-1])
+        back = int(86400 // step)
+        change = ((last / float(closes[-1 - back]) - 1) * 100
+                  if len(closes) > back else None)
+        stride = max(1, len(closes) // 56)
+        spark = [round(float(c), 6) for c in closes[::stride]]
+        if spark[-1] != round(last, 6):
+            spark.append(round(last, 6))
+        pairs.append({
+            "pair": base,
+            "symbol": pick["symbol"],
+            "file": pick["file"],
+            "timeframe": pick["timeframe"],
+            "last_close": last,
+            "change_24h_pct": change,
+            "spark": spark,
+            "age_seconds": max(0, int(time.time() - (st["last"] + step))),
+            "has_perp": any(x["exchange"].endswith("usdm") for x in items),
+            "n_datasets": len(items),
+        })
+    return {"pairs": pairs}
 
 
 def reports_payload() -> dict:
@@ -1294,7 +1424,11 @@ class Handler(SimpleHTTPRequestHandler):
             return self._send_json(health_payload())
 
         if route == "/api/snapshot":
-            return self._send_json(snapshot_payload())
+            q = parse_qs(parsed.query)
+            return self._send_json(snapshot_payload((q.get("symbol") or [None])[0]))
+
+        if route == "/api/overview":
+            return self._send_json(overview_payload())
 
         if route == "/api/reports":
             return self._send_json(reports_payload())

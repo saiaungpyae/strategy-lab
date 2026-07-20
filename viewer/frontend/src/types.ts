@@ -8,14 +8,31 @@ export interface DatasetInfo {
   label: string
 }
 
+// stats are absent when the server could not read the file (error is set);
+// `gaps` counts missing bars (expected-from-span minus actual rows)
 export interface HealthDataset extends DatasetInfo {
-  rows: number
-  first: number
-  last: number
-  age_seconds: number
-  bars_behind: number | null
-  gaps: number
-  size_bytes: number
+  error?: string
+  rows?: number
+  first?: number
+  last?: number
+  age_seconds?: number
+  bars_behind?: number | null
+  gaps?: number
+  size_bytes?: number
+}
+
+export interface OverviewPair {
+  pair: string
+  error?: string
+  symbol?: string
+  file?: string
+  timeframe?: string
+  last_close?: number
+  change_24h_pct?: number | null
+  spark?: number[]
+  age_seconds?: number
+  has_perp?: boolean
+  n_datasets?: number
 }
 
 export interface RefreshResult {

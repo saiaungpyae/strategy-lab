@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
 import {
   createColumnHelper,
   flexRender,
@@ -229,10 +230,11 @@ export default function EvoBots() {
 
   return (
     <div className="swarm">
-      <div className="top">
-        <h1>
-          strategy-lab <span>/ Evolution / Top bots</span>
-        </h1>
+      <TopNav />
+      <div className="toolbar">
+        <span className="crumb">
+          Evolution <span>/ Top bots</span>
+        </span>
         <select
           title="evolution run"
           value={run}
@@ -249,9 +251,8 @@ export default function EvoBots() {
             <option value="">no finished evolution runs</option>
           )}
         </select>
-        <span style={{ flex: 1 }} />
+        <span className="spacer" />
         <Link to={'/evolution' + (run ? `?run=${encodeURIComponent(run)}` : '')}>← evolution</Link>
-        <Link to="/">dashboard</Link>
       </div>
       <div className="wrap">
         {!data ? (

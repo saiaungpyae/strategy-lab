@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
 import { getJSON, postJSON } from '../../lib/api'
 import type { Recap, StartResult, SwarmProgress, SwarmRunInfo, SwarmRunsPayload } from '../../types'
 import OverviewTab from './OverviewTab'
@@ -110,10 +110,11 @@ export default function Swarm() {
 
   return (
     <div className="swarm">
-      <div className="top">
-        <h1>
-          strategy-lab <span>/ Bot Swarm</span>
-        </h1>
+      <TopNav>
+        <span className="refresh-status">{progressText}</span>
+      </TopNav>
+      <div className="toolbar">
+        <span className="crumb">Bot Swarm</span>
         <select
           title="run"
           value={runId}
@@ -135,10 +136,6 @@ export default function Swarm() {
         <button className="primary" onClick={() => setNewRunOpen((o) => !o)}>
           New run…
         </button>
-        <span className="muted">{progressText}</span>
-        <span style={{ flex: 1 }} />
-        <Link to="/">← dashboard</Link>
-        <Link to="/evolution">evolution</Link>
       </div>
       <div className={'top newrun' + (newRunOpen ? ' open' : '')}>
         <label>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
 import { getJSON } from '../../lib/api'
 import type {
   BinanceAssetRow, BinanceOrder, BinancePayload, BinancePosition,
@@ -263,16 +264,25 @@ export default function Binance() {
 
   return (
     <div className="dash bx">
-      <header>
-        <h1>🏦 binance account</h1>
-        <Link to="/" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>dashboard →</Link>
-        <Link to="/paper" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>paper trading →</Link>
-        <span className="spacer" />
+      <TopNav>
         <span className="refresh-status">
           read-only{data?.generated_ms ? ` · snapshot ${age(data.generated_ms)}` : ''}
         </span>
-      </header>
+      </TopNav>
       <main>
+        {!data && !err && (
+          <>
+            <div className="bx-kpis">
+              <div className="skel tile" />
+              <div className="skel tile" />
+              <div className="skel tile" />
+              <div className="skel tile" />
+            </div>
+            <div className="skel short" style={{ marginTop: 14, height: 36 }} />
+            <div className="skel block" style={{ marginTop: 14 }} />
+            <div className="skel block" style={{ marginTop: 14, height: 160 }} />
+          </>
+        )}
         {err && (
           <p className="empty">
             {err}

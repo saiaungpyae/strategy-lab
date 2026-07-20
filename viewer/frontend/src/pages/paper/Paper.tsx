@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
 import { getJSON } from '../../lib/api'
 import { fmt } from '../../lib/format'
 import type { PaperBot, PaperPayload } from '../../types'
@@ -263,11 +264,7 @@ export default function Paper() {
 
   return (
     <div className="dash">
-      <header>
-        <h1>🧾 paper trading</h1>
-        <Link to="/" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>dashboard →</Link>
-        <Link to="/evolution" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>evolution →</Link>
-        <span className="spacer" />
+      <TopNav>
         {st && (stale ? (
           <span className="refresh-status busy">
             ⚠ daemon stale — last cycle {age(st.generated_ms)}
@@ -278,8 +275,15 @@ export default function Paper() {
             title={`daemon alive — last cycle ${age(st.generated_ms)}`}
           />
         ))}
-      </header>
+      </TopNav>
       <main>
+        {!data && !err && (
+          <>
+            <div className="skel short" style={{ height: 44 }} />
+            <div className="skel block" style={{ marginTop: 14 }} />
+            <div className="skel short" style={{ marginTop: 14 }} />
+          </>
+        )}
         {err && (
           <p className="empty">
             {err} — freeze a roster with <code>python -m strategylab.paper select</code>

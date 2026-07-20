@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
 import {
   createChart,
   type CandlestickData,
@@ -447,10 +448,11 @@ export default function ChartView() {
 
   return (
     <div className="chartpage">
-      <header>
-        <h1>
-          <Link to="/">📈</Link> {botMode ? `bot ${botId} positions` : 'candle viewer'}
-        </h1>
+      <TopNav>
+        <span className="status">{status}</span>
+      </TopNav>
+      <div className="toolbar">
+        <span className="crumb">{botMode ? `Bot ${botId} positions` : 'Candle viewer'}</span>
         <label>dataset</label>
         <select value={file} onChange={(e) => setFile(e.target.value)}>
           {file && !files.some((f) => f.file === file) && (
@@ -537,9 +539,7 @@ export default function ChartView() {
         )}
         <button onClick={loadCandles}>reload</button>
         <span className="meta">{meta}</span>
-        <span className="spacer" />
-        <span className="status">{status}</span>
-      </header>
+      </div>
       <div className="chart-container" ref={containerRef}>
         <canvas className="fvg-canvas" ref={fvgCanvasRef} />
       </div>

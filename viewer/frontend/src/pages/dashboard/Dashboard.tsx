@@ -1,70 +1,97 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import TopNav from '../../components/TopNav'
+import Sparkline from '../../components/Sparkline'
 import { getJSON, postJSON } from '../../lib/api'
 import { fmtAge, fmtDate, fmtNum, fmtSize } from '../../lib/format'
 import type {
   HealthDataset,
   HealthPayload,
+  OverviewPair,
   RefreshStatus,
   ReportItem,
   SnapshotDataset,
 } from '../../types'
-import MiniChart from './MiniChart'
 
+// keeps lightweight-charts out of the initial bundle
+const MiniChart = lazy(() => import('./MiniChart'))
+
+const TFS = ['5m', '15m', '1h', '4h']
 const SIGS = [
-  ['ema_cross', 'EMA 12/26'],
-  ['sma_cross', 'SMA 50/200'],
-  ['supertrend', 'Supertrend'],
+  ['ema_cross', 'EMA'],
+  ['sma_cross', 'SMA'],
+  ['supertrend', 'ST'],
 ] as const
 
-const tfSec = (tf: string): number => {
-  const m = tf.match(/^(\d+)([smhdwM])$/)
-  return m ? +m[1] * { s: 1, m: 60, h: 3600, d: 86400, w: 604800, M: 2592000 }[m[2] as 's' | 'm' | 'h' | 'd' | 'w' | 'M']! : 0
-}
-
+const basePair = (symbol: string) => symbol.split('/')[0]
+const isPerp = (d: { exchange: string }) => d.exchange.endsWith('usdm')
 const chartHref = (file: string) => `/chart?file=${encodeURIComponent(file)}`
 
+// freshness in bars for intraday tapes (health matrix)
+const freshClass = (behind: number | null | undefined) =>
+  behind == null ? 'none' : behind <= 1 ? 'fresh' : behind <= 50 ? 'stale' : 'old'
+
+// freshness in wall-clock time for the overview's 1h tape
+const ageClass = (s: number | undefined) =>
+  s == null ? 'none' : s <= 2 * 3600 ? 'fresh' : s <= 86400 ? 'stale' : 'old'
+
 export default function Dashboard() {
-  const [datasets, setDatasets] = useState<HealthDataset[]>([])
-  const [healthLoaded, setHealthLoaded] = useState(false)
-  const [snapshot, setSnapshot] = useState<SnapshotDataset[] | null>(null)
+  const [overview, setOverview] = useState<OverviewPair[] | null>(null)
+  const [health, setHealth] = useState<HealthDataset[] | null>(null)
   const [reports, setReports] = useState<ReportItem[] | null>(null)
+  const [snapshot, setSnapshot] = useState<SnapshotDataset[] | null>(null)
   const [refresh, setRefresh] = useState<RefreshStatus | null>(null)
-  const [symbol, setSymbol] = useState('')
+  const [pair, setPair] = useState('')
+  const [market, setMarket] = useState<'spot' | 'perp'>('spot')
+  const [allReports, setAllReports] = useState(false)
+  const [snapVer, setSnapVer] = useState(0)
 
   useEffect(() => {
     document.title = 'strategy-lab · dashboard'
   }, [])
 
+  const loadOverview = useCallback(async () => {
+    const d = await getJSON<{ pairs: OverviewPair[] }>('/api/overview')
+    setOverview(d.pairs)
+  }, [])
   const loadHealth = useCallback(async () => {
     const d = await getJSON<HealthPayload>('/api/health')
-    setDatasets(d.datasets)
-    setHealthLoaded(true)
+    setHealth(d.datasets)
     setRefresh(d.refresh)
   }, [])
-
-  const loadSnapshot = useCallback(async () => {
-    const d = await getJSON<{ datasets: SnapshotDataset[] }>('/api/snapshot')
-    setSnapshot(d.datasets)
-  }, [])
-
   const loadReports = useCallback(async () => {
     const d = await getJSON<{ reports: ReportItem[] }>('/api/reports')
     setReports(d.reports)
   }, [])
 
   useEffect(() => {
+    loadOverview()
     loadHealth()
-    loadSnapshot()
     loadReports()
-  }, [loadHealth, loadSnapshot, loadReports])
+  }, [loadOverview, loadHealth, loadReports])
 
-  // keep the symbol selection valid as datasets arrive/change
-  const symbols = [...new Set(datasets.map((d) => d.symbol))]
+  // default to BTC once the pair list arrives (fall back to the first pair)
   useEffect(() => {
-    if (!symbols.includes(symbol) && symbols.length) setSymbol(symbols[0])
+    if (!overview?.length) return
+    if (!overview.some((p) => p.pair === pair))
+      setPair(overview.some((p) => p.pair === 'BTC') ? 'BTC' : overview[0].pair)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [datasets])
+  }, [overview])
+
+  // signals only for the selected pair — the server computes just those files
+  useEffect(() => {
+    if (!pair) return
+    let alive = true
+    setSnapshot(null)
+    getJSON<{ datasets: SnapshotDataset[] }>(
+      `/api/snapshot?symbol=${encodeURIComponent(pair)}`,
+    ).then((d) => {
+      if (alive) setSnapshot(d.datasets)
+    })
+    return () => {
+      alive = false
+    }
+  }, [pair, snapVer])
 
   // poll while a refresh is running; reload everything when it finishes
   useEffect(() => {
@@ -73,12 +100,13 @@ export default function Dashboard() {
       const r = await getJSON<RefreshStatus>('/api/refresh')
       setRefresh(r)
       if (r.state !== 'running') {
+        loadOverview()
         loadHealth()
-        loadSnapshot()
+        setSnapVer((v) => v + 1)
       }
     }, 2000)
     return () => clearInterval(t)
-  }, [refresh?.state, loadHealth, loadSnapshot])
+  }, [refresh?.state, loadOverview, loadHealth])
 
   const triggerRefresh = async () => {
     setRefresh(await postJSON<RefreshStatus>('/api/refresh'))
@@ -92,186 +120,335 @@ export default function Dashboard() {
     refreshText = `refreshed: +${fmtNum(added)} candles` + (errs ? ` · ${errs} error(s)` : '')
   }
 
-  const gridFiles = datasets
-    .filter((d) => d.symbol === symbol)
-    .sort((a, b) => tfSec(a.timeframe) - tfSec(b.timeframe))
+  const gridFiles = useMemo(
+    () =>
+      (health ?? [])
+        .filter(
+          (d) =>
+            !d.error &&
+            basePair(d.symbol) === pair &&
+            isPerp(d) === (market === 'perp') &&
+            TFS.includes(d.timeframe),
+        )
+        .sort((a, b) => TFS.indexOf(a.timeframe) - TFS.indexOf(b.timeframe)),
+    [health, pair, market],
+  )
+
+  const snapByFile = useMemo(() => {
+    const m = new Map<string, SnapshotDataset>()
+    for (const s of snapshot ?? []) if (!s.error) m.set(s.file, s)
+    return m
+  }, [snapshot])
+
+  type MatrixRow = {
+    pair: string
+    cells: Record<'spot' | 'perp', Record<string, HealthDataset | undefined>>
+    rows: number
+    size: number
+    missing: number
+  }
+  const matrix = useMemo<MatrixRow[]>(() => {
+    const rows = new Map<string, MatrixRow>()
+    for (const d of health ?? []) {
+      const p = basePair(d.symbol)
+      let r = rows.get(p)
+      if (!r) rows.set(p, (r = { pair: p, cells: { spot: {}, perp: {} }, rows: 0, size: 0, missing: 0 }))
+      r.cells[isPerp(d) ? 'perp' : 'spot'][d.timeframe] = d
+      r.rows += d.rows ?? 0
+      r.size += d.size_bytes ?? 0
+      r.missing += d.gaps ?? 0
+    }
+    return [...rows.values()].sort((a, b) => a.pair.localeCompare(b.pair))
+  }, [health])
+
+  const totalSize = matrix.reduce((a, r) => a + r.size, 0)
+  const totalMissing = matrix.reduce((a, r) => a + r.missing, 0)
+  const sortedReports = useMemo(
+    () => [...(reports ?? [])].sort((a, b) => b.mtime - a.mtime),
+    [reports],
+  )
 
   return (
     <div className="dash">
-      <header>
-        <h1>📊 strategy-lab</h1>
-        <label>symbol</label>
-        <select value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-          {symbols.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
-        <Link to="/chart" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
-          open chart view →
-        </Link>
-        <Link to="/swarm" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
-          bot swarm →
-        </Link>
-        <Link to="/evolution" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
-          evolution →
-        </Link>
-        <Link to="/paper" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
-          paper trading →
-        </Link>
-        <Link to="/binance" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
-          binance →
-        </Link>
-        <span className="spacer" />
+      <TopNav>
         <span className={'refresh-status' + (refresh?.state === 'running' ? ' busy' : '')}>
           {refreshText}
         </span>
-        <button onClick={triggerRefresh}>⟳ refresh data</button>
-      </header>
+        <button onClick={triggerRefresh} disabled={refresh?.state === 'running'}>
+          ⟳ Refresh data
+        </button>
+      </TopNav>
+
       <main>
-        <h2>Data health</h2>
-        <div className="cards">
-          {!healthLoaded ? (
-            <span className="empty">loading…</span>
-          ) : !datasets.length ? (
-            <span className="empty">no datasets in data/</span>
+        <section>
+          <div className="sec-head">
+            <h2>Market overview</h2>
+            {overview && health && (
+              <span className="sec-meta">
+                {overview.length} pairs · {health.length} datasets · {fmtSize(totalSize)}
+              </span>
+            )}
+          </div>
+          {!overview ? (
+            <div className="skel block" />
+          ) : !overview.length ? (
+            <div className="empty">no datasets in data/ — hit “Refresh data” after fetching</div>
           ) : (
-            datasets.map((ds) => <HealthCard key={ds.file} ds={ds} />)
-          )}
-        </div>
-
-        <h2>
-          Multi-timeframe · <span>{symbol}</span>
-        </h2>
-        <div className="tfgrid">
-          {gridFiles.map((ds) => (
-            <div className="pane" key={ds.file}>
-              <div className="bar">
-                <b>{ds.timeframe}</b>&nbsp;
-                <span style={{ color: 'var(--muted)' }}>· {ds.exchange}</span>
-                <Link to={chartHref(ds.file)}>open →</Link>
-              </div>
-              <MiniChart file={ds.file} />
+            <div className="panel tablewrap">
+              <table className="mkt">
+                <thead>
+                  <tr>
+                    <th>Pair</th>
+                    <th className="num">Price</th>
+                    <th className="num">24h</th>
+                    <th>7d</th>
+                    <th>Fresh</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {overview.map((p) =>
+                    p.error ? (
+                      <tr key={p.pair}>
+                        <td>
+                          <b>{p.pair}</b>
+                        </td>
+                        <td colSpan={5} className="err">
+                          {p.error}
+                        </td>
+                      </tr>
+                    ) : (
+                      <tr
+                        key={p.pair}
+                        className={p.pair === pair ? 'sel' : ''}
+                        onClick={() => setPair(p.pair)}
+                      >
+                        <td>
+                          <span className="pairmark">{p.pair.slice(0, 2)}</span>
+                          <b>{p.pair}</b>
+                          <span className="sub">/USDT{p.has_perp ? ' + perp' : ''}</span>
+                        </td>
+                        <td className="num strong">{fmtNum(p.last_close!)}</td>
+                        <td className={'num ' + ((p.change_24h_pct ?? 0) >= 0 ? 'pos' : 'neg')}>
+                          {p.change_24h_pct == null
+                            ? '–'
+                            : (p.change_24h_pct >= 0 ? '+' : '') +
+                              p.change_24h_pct.toFixed(2) +
+                              '%'}
+                        </td>
+                        <td>
+                          <Sparkline data={p.spark!} up={(p.change_24h_pct ?? 0) >= 0} />
+                        </td>
+                        <td>
+                          <span
+                            className={'dot ' + ageClass(p.age_seconds)}
+                            title={fmtAge(p.age_seconds ?? 0)}
+                          />
+                        </td>
+                        <td className="act">
+                          <Link to={chartHref(p.file!)} onClick={(e) => e.stopPropagation()}>
+                            chart →
+                          </Link>
+                        </td>
+                      </tr>
+                    ),
+                  )}
+                </tbody>
+              </table>
             </div>
-          ))}
-        </div>
-
-        <h2>Signal snapshot</h2>
-        <SnapshotTable snapshot={snapshot} />
-
-        <h2>Reports</h2>
-        <div className="reports">
-          {!reports ? (
-            <span className="empty">loading…</span>
-          ) : !reports.length ? (
-            <span className="empty">nothing in reports/ yet</span>
-          ) : (
-            reports.map((r) => (
-              <a
-                key={r.file}
-                className="report"
-                href={`/reports/${encodeURIComponent(r.file)}`}
-                target="_blank"
-                rel="noreferrer"
-              >
-                <span className="kind">{r.kind}</span>
-                {r.file}
-                <span className="rmeta">
-                  {fmtSize(r.size_bytes)} · {fmtDate(r.mtime)}
-                </span>
-              </a>
-            ))
           )}
-        </div>
-      </main>
-    </div>
-  )
-}
+        </section>
 
-function HealthCard({ ds }: { ds: HealthDataset }) {
-  const behind = ds.bars_behind ?? 0
-  const cls = behind <= 1 ? 'fresh' : behind <= 50 ? 'stale' : 'old'
-  const badge = behind <= 1 ? 'fresh' : `${fmtNum(behind)} bars`
-  return (
-    <Link className="card" to={chartHref(ds.file)}>
-      <div className="top">
-        <span className="name">
-          {ds.symbol} · {ds.timeframe}
-        </span>
-        <span style={{ color: 'var(--muted)', fontSize: '11.5px' }}>{ds.exchange}</span>
-        <span className={`badge ${cls}`}>{badge}</span>
-      </div>
-      <div className="kv">
-        <span>candles</span>
-        <b>{fmtNum(ds.rows)}</b>
-        <span>span</span>
-        <b>
-          {fmtDate(ds.first)} → {fmtDate(ds.last)}
-        </b>
-        <span>freshness</span>
-        <b>{fmtAge(ds.age_seconds)}</b>
-        <span>gaps · size</span>
-        <b>
-          {ds.gaps} · {fmtSize(ds.size_bytes)}
-        </b>
-      </div>
-    </Link>
-  )
-}
-
-function SnapshotTable({ snapshot }: { snapshot: SnapshotDataset[] | null }) {
-  if (!snapshot) return <span className="empty">loading…</span>
-  if (!snapshot.length) return <span className="empty">no datasets</span>
-  return (
-    <table>
-      <thead>
-        <tr>
-          <th>dataset</th>
-          <th>last close</th>
-          <th>24h</th>
-          {SIGS.map(([, label]) => (
-            <th key={label}>{label}</th>
-          ))}
-          <th>open FVGs</th>
-        </tr>
-      </thead>
-      <tbody>
-        {snapshot.map((ds) =>
-          ds.error ? (
-            <tr key={ds.file}>
-              <td>{ds.label}</td>
-              <td colSpan={6} style={{ color: 'var(--down)' }}>
-                {ds.error}
-              </td>
-            </tr>
+        <section>
+          <div className="sec-head">
+            <h2>Timeframes</h2>
+            <div className="chips">
+              {(overview ?? []).map((p) => (
+                <button
+                  key={p.pair}
+                  className={'chip' + (p.pair === pair ? ' active' : '')}
+                  onClick={() => setPair(p.pair)}
+                >
+                  {p.pair}
+                </button>
+              ))}
+            </div>
+            <span className="spacer" />
+            <div className="seg">
+              <button className={market === 'spot' ? 'active' : ''} onClick={() => setMarket('spot')}>
+                Spot
+              </button>
+              <button className={market === 'perp' ? 'active' : ''} onClick={() => setMarket('perp')}>
+                Perp
+              </button>
+            </div>
+          </div>
+          {!health ? (
+            <div className="skel block" />
+          ) : !gridFiles.length ? (
+            <div className="empty">
+              no {market} datasets for {pair || '—'}
+            </div>
           ) : (
-            <tr key={ds.file}>
-              <td>
-                <Link to={chartHref(ds.file)} style={{ textDecoration: 'none' }}>
-                  {ds.symbol} · {ds.timeframe}
-                </Link>
-              </td>
-              <td className="num">{fmtNum(ds.last_close)}</td>
-              <td className={'num ' + ((ds.change_24h_pct ?? 0) >= 0 ? 'pos' : 'neg')}>
-                {ds.change_24h_pct == null
-                  ? '–'
-                  : (ds.change_24h_pct >= 0 ? '+' : '') + ds.change_24h_pct.toFixed(2) + '%'}
-              </td>
-              {SIGS.map(([key]) => {
-                const s = ds.signals[key]
+            <div className="tfgrid">
+              {gridFiles.map((ds) => {
+                const snap = snapByFile.get(ds.file)
                 return (
-                  <td key={key}>
-                    <span className={`sig ${s.state}`}>{s.state}</span>
-                    <small className="muted"> {fmtNum(s.bars_since_flip)} bars ago</small>
-                  </td>
+                  <div className="pane" key={ds.file}>
+                    <div className="bar">
+                      <b>{ds.timeframe}</b>
+                      <span className="sub">{market}</span>
+                      <span className="sigchips">
+                        {snap ? (
+                          SIGS.map(([key, label]) => {
+                            const s = snap.signals[key]
+                            return (
+                              <span
+                                key={key}
+                                className={`sigchip ${s.state}`}
+                                title={`${label} · ${s.state} · flipped ${fmtNum(s.bars_since_flip)} bars ago`}
+                              >
+                                {label}
+                              </span>
+                            )
+                          })
+                        ) : (
+                          <span className="sigchip">…</span>
+                        )}
+                        {snap && snap.signals.fvg_open > 0 && (
+                          <span className="sigchip fvg" title="open fair-value gaps">
+                            {snap.signals.fvg_open} FVG
+                          </span>
+                        )}
+                      </span>
+                      <Link className="open" to={chartHref(ds.file)}>
+                        open →
+                      </Link>
+                    </div>
+                    <Suspense fallback={<div className="minichart skel" />}>
+                      <MiniChart file={ds.file} />
+                    </Suspense>
+                  </div>
                 )
               })}
-              <td className="num">{ds.signals.fvg_open}</td>
-            </tr>
-          ),
-        )}
-      </tbody>
-    </table>
+            </div>
+          )}
+        </section>
+
+        <section>
+          <div className="sec-head">
+            <h2>Data health</h2>
+            {health && (
+              <span className="sec-meta">
+                {totalMissing ? `${fmtNum(totalMissing)} missing bars total` : 'no missing bars'}
+              </span>
+            )}
+          </div>
+          {!health ? (
+            <div className="skel block" />
+          ) : (
+            <div className="panel tablewrap">
+              <table className="healthmx">
+                <thead>
+                  <tr>
+                    <th rowSpan={2} className="l">
+                      Pair
+                    </th>
+                    <th colSpan={4}>Spot</th>
+                    <th colSpan={4}>Perp</th>
+                    <th rowSpan={2} className="num">
+                      Rows
+                    </th>
+                    <th rowSpan={2} className="num">
+                      Missing
+                    </th>
+                    <th rowSpan={2} className="num">
+                      Size
+                    </th>
+                  </tr>
+                  <tr>
+                    {[...TFS, ...TFS].map((tf, i) => (
+                      <th key={i} className="c">
+                        {tf}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {matrix.map((r) => (
+                    <tr key={r.pair}>
+                      <td className="l">
+                        <b>{r.pair}</b>
+                      </td>
+                      {(['spot', 'perp'] as const).flatMap((m) =>
+                        TFS.map((tf) => {
+                          const d = r.cells[m][tf]
+                          return (
+                            <td key={m + tf} className="c">
+                              {d && !d.error ? (
+                                <Link
+                                  to={chartHref(d.file)}
+                                  className={'dot ' + freshClass(d.bars_behind)}
+                                  title={
+                                    `${d.symbol} ${tf} (${m}) · ${fmtNum(d.rows ?? 0)} rows · ` +
+                                    `${fmtAge(d.age_seconds ?? 0)} · ${fmtNum(d.gaps ?? 0)} missing · ` +
+                                    fmtSize(d.size_bytes ?? 0)
+                                  }
+                                />
+                              ) : d ? (
+                                <span className="dot err" title={d.error} />
+                              ) : (
+                                <span className="dot none" />
+                              )}
+                            </td>
+                          )
+                        }),
+                      )}
+                      <td className="num sub2">{fmtNum(r.rows)}</td>
+                      <td className={'num ' + (r.missing ? 'warn' : 'sub2')}>{fmtNum(r.missing)}</td>
+                      <td className="num sub2">{fmtSize(r.size)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <section>
+          <div className="sec-head">
+            <h2>Reports</h2>
+            {sortedReports.length > 9 && (
+              <button className="linkbtn" onClick={() => setAllReports(!allReports)}>
+                {allReports ? 'show latest' : `show all (${sortedReports.length})`}
+              </button>
+            )}
+          </div>
+          {!reports ? (
+            <div className="skel block short" />
+          ) : !reports.length ? (
+            <div className="empty">nothing in reports/ yet</div>
+          ) : (
+            <div className="reports">
+              {sortedReports.slice(0, allReports ? undefined : 9).map((r) => (
+                <a
+                  key={r.file}
+                  className="report"
+                  href={`/reports/${encodeURIComponent(r.file)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <span className={'kind ' + r.kind}>{r.kind}</span>
+                  <span className="fname">{r.file}</span>
+                  <span className="rmeta">
+                    {fmtSize(r.size_bytes)} · {fmtDate(r.mtime)}
+                  </span>
+                </a>
+              ))}
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
   )
 }

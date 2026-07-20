@@ -59,7 +59,19 @@ sl-fetch -s BTC/USDT ETH/USDT SOL/USDT -t 15m --since 2023-06-01 -f parquet
 sl-fetch --exchange bybit -s BTC/USDT -t 4h --since 2022-01-01 --until 2023-01-01
 ```
 
-Output lands in `data/`, e.g. `data/binance_BTC-USDT_1h.csv`.
+Output lands in a per-pair folder under `data/ohlcv/`, e.g.
+`data/ohlcv/BTC-USDT/binance_BTC-USDT_1h.csv`. Derivatives metrics
+(`sl-swarm fetch-metrics` / `fetch-funding`) land in `data/metrics/<PAIR>/`,
+and pinned dataset snapshots live in `data/snapshots/` (never auto-updated):
+
+```
+data/
+├── ohlcv/BTC-USDT/binance_BTC-USDT_5m.csv     (+ .parquet sidecar caches)
+├── metrics/BTC-USDT/BTCUSDT_metrics.csv
+├── metrics/BTC-USDT/BTC-USDT-USDT_funding.csv
+└── snapshots/pin-YYYYMMDD/...
+```
+
 Columns: `timestamp` (epoch ms), `datetime` (UTC), `open`, `high`, `low`, `close`, `volume`.
 
 | Flag | Default | Meaning |
@@ -70,13 +82,14 @@ Columns: `timestamp` (epoch ms), `datetime` (UTC), `open`, `high`, `low`, `close
 | `--since` | 1 year ago | Start date `YYYY-MM-DD` (UTC) |
 | `--until` | now | End date `YYYY-MM-DD` (UTC, exclusive) |
 | `--format`, `-f` | `csv` | `csv` or `parquet` |
-| `--out`, `-o` | `data` | Output directory |
+| `--out`, `-o` | `data` | Data root (files land under `<out>/ohlcv/<PAIR>/`) |
 
 ### Keeping data current
 
-`sl-update` brings every dataset in `data/` up to the present **incrementally** —
-it reads the last saved candle per file and fetches only the missing span
-(re-finalizing the last candle and skipping the still-forming one):
+`sl-update` brings every dataset under `data/` up to the present
+**incrementally** — it reads the last saved candle per file and fetches only
+the missing span (re-finalizing the last candle and skipping the still-forming
+one). Pinned `data/snapshots/` are left untouched:
 
 ```bash
 sl-update            # update everything in data/
@@ -89,8 +102,8 @@ startup, and on demand via the dashboard's *refresh data* button
 
 ## 2. Backtest & research
 
-The commands fall into three groups. All take `--file data/<something>.csv` and default to
-the 1h BTC/USDT set.
+The commands fall into three groups. All take `--file data/ohlcv/<PAIR>/<something>.csv`
+and default to the 1h BTC/USDT set.
 
 ### Strategy comparison
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import CanvasBox from '../../components/CanvasBox'
+import TopNav from '../../components/TopNav'
 import { lines } from '../../lib/canvas'
 import { C } from '../../lib/colors'
 import { getJSON, postJSON } from '../../lib/api'
@@ -368,10 +369,13 @@ export default function Evolution() {
 
   return (
     <div className="swarm">
-      <div className="top">
-        <h1>
-          strategy-lab <span>/ Evolution</span>
-        </h1>
+      <TopNav>
+        <span className="refresh-status">
+          {starting ? '⏳ starting…' : running ? '⏳ evolution process running' : ''}
+        </span>
+      </TopNav>
+      <div className="toolbar">
+        <span className="crumb">Evolution</span>
         <select title="evolution run" value={e?.run_id ?? ''} onChange={(ev) => selectRun(ev.target.value)}>
           {evos.length ? (
             evos.map((x) => (
@@ -390,14 +394,9 @@ export default function Evolution() {
         <button className="primary" onClick={() => setFormOpen((o) => !o)}>
           New evolution…
         </button>
-        <span className="muted">
-          {starting ? '⏳ starting…' : running ? '⏳ evolution process running' : ''}
-        </span>
-        <span style={{ flex: 1 }} />
-        <Link to="/">← dashboard</Link>
-        <Link to="/swarm">bot swarm</Link>
+        <span className="spacer" />
         <Link to={'/evolution/bots' + (e ? `?run=${encodeURIComponent(e.run_id)}` : '')}>
-          top bots
+          top bots →
         </Link>
       </div>
       <div className={'top newrun' + (formOpen ? ' open' : '')}>
