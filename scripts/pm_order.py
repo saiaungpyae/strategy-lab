@@ -129,8 +129,9 @@ def cmd_place(args) -> None:
         l = {
             "symbol": args.symbol,
             "side": close_side,
-            "strategyType": kind,
-            "stopPrice": f"{snap(trigger, tick):.10f}".rstrip("0").rstrip("."),
+            "algoType": "CONDITIONAL",
+            "type": kind,
+            "triggerPrice": f"{snap(trigger, tick):.10f}".rstrip("0").rstrip("."),
             "quantity": payload["quantity"],
             "workingType": "MARK_PRICE",
         }
@@ -158,7 +159,7 @@ def cmd_place(args) -> None:
         legs.append(("TP", leg("TAKE_PROFIT_MARKET", args.tp)))
 
     for name, l in legs:
-        print(f"  {name} leg     {l['side']} {l['strategyType']} trigger {l['stopPrice']}"
+        print(f"  {name} leg     {l['side']} {l['type']} trigger {l['triggerPrice']}"
               f" (mark-price){' ' + pos_side if pos_side else ' reduce-only'}")
     if legs:
         print()
@@ -169,8 +170,10 @@ def cmd_place(args) -> None:
     resp = ex.papi_post_um_order(payload)
     print(f"  ✔ entry placed — orderId {resp.get('orderId')}, status {resp.get('status')}")
     for name, l in legs:
-        r = ex.papi_post_um_conditional_order(l)
-        print(f"  ✔ {name} conditional placed — strategyId {r.get('strategyId')}")
+        # conditional orders migrated to the Algo Service in 2026 — the old
+        # /um/conditional/* endpoints are gone (404)
+        r = ex.request("um/algo/order", "papi", "POST", l)
+        print(f"  ✔ {name} algo order placed — algoId {r.get('algoId', r)}")
 
 
 def cmd_protect(args) -> None:
@@ -197,32 +200,45 @@ def cmd_protect(args) -> None:
                              ("TP", "TAKE_PROFIT_MARKET", args.tp)):
         if trig is None:
             continue
-        l = {"symbol": args.symbol, "side": close_side, "strategyType": kind,
-             "stopPrice": f"{snap(trig, tick):.10f}".rstrip("0").rstrip("."),
+        l = {"symbol": args.symbol, "side": close_side,
+             "algoType": "CONDITIONAL", "type": kind,
+             "triggerPrice": f"{snap(trig, tick):.10f}".rstrip("0").rstrip("."),
              "quantity": qty, "workingType": "MARK_PRICE"}
         if dual:
             l["positionSide"] = "LONG" if long_side else "SHORT"
         else:
             l["reduceOnly"] = "true"
         legs.append((name, l))
-        print(f"  {name} leg     {l['side']} {kind} trigger {l['stopPrice']} (mark-price)")
+        print(f"  {name} leg     {l['side']} {kind} trigger {l['triggerPrice']} (mark-price)")
 
     if not args.live:
         print("\n  DRY RUN — nothing sent. Re-run with --live to place the legs.")
         return
     for name, l in legs:
-        r = ex.papi_post_um_conditional_order(l)
-        print(f"  ✔ {name} conditional placed — strategyId {r.get('strategyId')}")
+        r = ex.request("um/algo/order", "papi", "POST", l)
+        print(f"  ✔ {name} algo order placed — algoId {r.get('algoId', r)}")
 
 
 def cmd_list(args) -> None:
     ex = client()
     orders = ex.papi_get_um_openorders()
-    if not orders:
+    try:
+        conds = ex.request("um/algo/openOrders", "papi", "GET", {})
+        if isinstance(conds, dict):
+            conds = conds.get("orders") or conds.get("data") or []
+    except Exception:
+        conds = None  # Binance hasn't deployed the algo query endpoint yet
+    if not orders and not conds:
         print("no open UM orders")
     for o in orders:
         print(f"  {o['orderId']}  {o['symbol']}  {o['side']} {o['type']} "
               f"{o['origQty']} @ {o['price']}  ({o['status']})")
+    for o in conds or []:
+        print(f"  {o.get('algoId')}  {o['symbol']}  {o['side']} {o.get('strategyType')} "
+              f"{o.get('origQty')} trigger {o.get('stopPrice')}")
+    if conds is None:
+        print("  (algo/TP-SL orders can't be queried yet — Binance hasn't deployed "
+              "the query endpoint; check the app to see them)")
 
 
 def cmd_cancel(args) -> None:
@@ -237,10 +253,13 @@ def cmd_cancel(args) -> None:
 def cmd_cancel_all(args) -> None:
     ex = client()
     if not args.live:
-        print(f"DRY RUN — would cancel ALL open UM orders on {args.symbol}")
+        print(f"DRY RUN — would cancel ALL open UM orders AND conditional "
+              f"orders on {args.symbol}")
         return
     r = ex.papi_delete_um_allopenorders({"symbol": args.symbol})
-    print(f"✔ cancel-all on {args.symbol}: {r}")
+    print(f"✔ cancel-all regular orders on {args.symbol}: code {r.get('code')}")
+    r = ex.request("um/algo/allOpenOrders", "papi", "DELETE", {"symbol": args.symbol})
+    print(f"✔ cancel-all algo (TP/SL) orders on {args.symbol}: code {r.get('code')}")
 
 
 def main() -> None:

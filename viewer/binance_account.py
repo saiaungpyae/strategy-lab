@@ -267,9 +267,11 @@ def _pm_section(spot, price_of) -> dict:
         except Exception:
             pass  # unopened market side (e.g. CM) — same rationale as positions
 
-    # PM has no attached-TP/SL orders — stops live as separate *conditional*
-    # orders (STOP / TAKE_PROFIT / STOP_MARKET / ...), fetched separately.
-    for fetch, market in ((spot.papi_get_um_conditional_openorders, "UM"),
+    def um_algo_orders():
+        r = spot.request("um/algo/openOrders", "papi", "GET", {})
+        return (r.get("orders") or r.get("data") or []) if isinstance(r, dict) else r
+
+    for fetch, market in ((um_algo_orders, "UM"),
                           (spot.papi_get_cm_conditional_openorders, "CM")):
         try:
             for o in fetch():
