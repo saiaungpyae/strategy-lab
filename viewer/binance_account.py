@@ -271,6 +271,7 @@ def _pm_section(spot, price_of) -> dict:
         r = spot.request("um/algo/openOrders", "papi", "GET", {})
         return (r.get("orders") or r.get("data") or []) if isinstance(r, dict) else r
 
+    algo_query_down = False
     for fetch, market in ((um_algo_orders, "UM"),
                           (spot.papi_get_cm_conditional_openorders, "CM")):
         try:
@@ -279,19 +280,45 @@ def _pm_section(spot, price_of) -> dict:
                     "symbol": o.get("symbol"),
                     "market": market,
                     "side": (o.get("side") or "").lower(),
-                    "type": (o.get("strategyType") or "").lower(),
+                    "type": (o.get("type") or o.get("strategyType") or "").lower(),
                     "price": _f(o.get("price")) or None,
-                    "trigger": _f(o.get("stopPrice")) or None,
+                    "trigger": _f(o.get("triggerPrice")) or _f(o.get("stopPrice")) or None,
                     "amount": _f(o.get("origQty")),
                     "filled": 0.0,
                     "reduce_only": bool(o.get("reduceOnly")),
                     "created_ms": int(_f(o.get("bookTime"))) or None,
                 })
         except Exception:
+            if market == "UM":
+                algo_query_down = True
+
+    if algo_query_down:
+        # fall back to the placement log scripts/pm_order.py keeps — live
+        # status can't be verified until Binance ships the algo query API
+        import json as _json
+        from pathlib import Path as _Path
+        log = _Path(__file__).resolve().parent.parent / "reports" / "pm" / "algo_orders.json"
+        try:
+            for r in _json.loads(log.read_text()):
+                orders.append({
+                    "symbol": r.get("symbol"),
+                    "market": "UM",
+                    "side": (r.get("side") or "").lower(),
+                    "type": (r.get("type") or "").lower(),
+                    "price": None,
+                    "trigger": _f(r.get("trigger")) or None,
+                    "amount": _f(r.get("qty")),
+                    "filled": 0.0,
+                    "reduce_only": True,
+                    "local": True,
+                    "created_ms": r.get("placed_ms"),
+                })
+        except Exception:
             pass
 
     return {
         "open_orders": orders,
+        "algo_query_down": algo_query_down,
         "assets": assets,
         "value_usd": value,
         "equity_usd": _f(acct.get("accountEquity")),

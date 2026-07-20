@@ -26,12 +26,45 @@ Keys come from <repo>/.env (BINANCE_API_KEY / BINANCE_API_SECRET).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "viewer"))
+
+# Binance's algo (TP/SL) service currently has NO query endpoint on papi —
+# placement and cancel work, reads 404/405. Until they ship it, we keep our
+# own record of every algo order we place. The dashboard reads this too.
+ALGO_LOG = REPO / "reports" / "pm" / "algo_orders.json"
+
+
+def load_algo_log() -> list:
+    try:
+        return json.loads(ALGO_LOG.read_text())
+    except Exception:
+        return []
+
+
+def save_algo_log(rows: list) -> None:
+    ALGO_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ALGO_LOG.write_text(json.dumps(rows, indent=1))
+
+
+def record_algo(resp: dict, leg: dict) -> None:
+    rows = load_algo_log()
+    rows.append({
+        "algoId": resp.get("algoId"),
+        "symbol": leg["symbol"],
+        "side": leg["side"],
+        "type": leg["type"],
+        "trigger": leg["triggerPrice"],
+        "qty": leg["quantity"],
+        "placed_ms": int(time.time() * 1000),
+    })
+    save_algo_log(rows)
 
 
 def load_env() -> None:
@@ -173,6 +206,7 @@ def cmd_place(args) -> None:
         # conditional orders migrated to the Algo Service in 2026 — the old
         # /um/conditional/* endpoints are gone (404)
         r = ex.request("um/algo/order", "papi", "POST", l)
+        record_algo(r, l)
         print(f"  ✔ {name} algo order placed — algoId {r.get('algoId', r)}")
 
 
@@ -216,6 +250,7 @@ def cmd_protect(args) -> None:
         return
     for name, l in legs:
         r = ex.request("um/algo/order", "papi", "POST", l)
+        record_algo(r, l)
         print(f"  ✔ {name} algo order placed — algoId {r.get('algoId', r)}")
 
 
@@ -234,11 +269,15 @@ def cmd_list(args) -> None:
         print(f"  {o['orderId']}  {o['symbol']}  {o['side']} {o['type']} "
               f"{o['origQty']} @ {o['price']}  ({o['status']})")
     for o in conds or []:
-        print(f"  {o.get('algoId')}  {o['symbol']}  {o['side']} {o.get('strategyType')} "
-              f"{o.get('origQty')} trigger {o.get('stopPrice')}")
+        print(f"  {o.get('algoId')}  {o['symbol']}  {o['side']} {o.get('type') or o.get('strategyType')} "
+              f"{o.get('origQty')} trigger {o.get('triggerPrice') or o.get('stopPrice')}")
     if conds is None:
-        print("  (algo/TP-SL orders can't be queried yet — Binance hasn't deployed "
-              "the query endpoint; check the app to see them)")
+        local = load_algo_log()
+        for r in local:
+            print(f"  {r['algoId']}  {r['symbol']}  {r['side']} {r['type']} "
+                  f"{r['qty']} trigger {r['trigger']}  (local record)")
+        print("  (Binance hasn't deployed the algo query API — 'local record' rows "
+              "come from this script's placement log; verify in the app)")
 
 
 def cmd_cancel(args) -> None:
@@ -260,6 +299,9 @@ def cmd_cancel_all(args) -> None:
     print(f"✔ cancel-all regular orders on {args.symbol}: code {r.get('code')}")
     r = ex.request("um/algo/allOpenOrders", "papi", "DELETE", {"symbol": args.symbol})
     print(f"✔ cancel-all algo (TP/SL) orders on {args.symbol}: code {r.get('code')}")
+    kept = [x for x in load_algo_log() if x["symbol"] != args.symbol]
+    save_algo_log(kept)
+    print(f"✔ cleared local algo records for {args.symbol}")
 
 
 def main() -> None:

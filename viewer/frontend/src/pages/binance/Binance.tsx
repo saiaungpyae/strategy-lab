@@ -219,6 +219,7 @@ function OrdersTable({ orders, showMarket }: { orders: BinanceOrder[]; showMarke
               {o.type}
               {o.trigger != null && <span className="muted"> @ {px(o.trigger)}</span>}
               {o.reduce_only ? <span className="muted"> · RO</span> : null}
+              {o.local ? <span className="warn" title="from the placement log — live status not verifiable until Binance ships the algo query API"> · local</span> : null}
             </td>
             <td>{px(o.price)}</td>
             <td>{qty(o.amount)}</td>
@@ -385,6 +386,13 @@ export default function Binance() {
                 </Card>
                 <Card title="Open orders" meta={`${pmOrders.length} · UM + CM + margin`}>
                   <OrdersTable orders={pmOrders} showMarket />
+                  {pm.algo_query_down && (
+                    <p className="bx-empty" style={{ paddingTop: 0 }}>
+                      {pmOrders.some((o) => o.local)
+                        ? "rows tagged 'local' come from the placement log — Binance hasn't shipped the algo query API yet, so their live status can't be verified (check the app)"
+                        : "⚠ TP/SL (algo) orders placed outside pm_order.py can't be shown — Binance removed the old query API and hasn't deployed the new one yet; see them in the Binance app"}
+                    </p>
+                  )}
                 </Card>
               </>
             )}

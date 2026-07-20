@@ -706,6 +706,7 @@ export interface BinanceOrder {
   amount: number
   filled: number
   reduce_only?: boolean
+  local?: boolean
   created_ms: number | null
 }
 
@@ -718,6 +719,7 @@ export interface BinancePM {
   status: string | null
   positions: BinancePosition[]
   open_orders: BinanceOrder[]
+  algo_query_down?: boolean
 }
 
 export interface BinanceRestrictions {
