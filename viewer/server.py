@@ -64,6 +64,9 @@ from strategylab.backtest.fvg import FVGParams, run_fvg_study  # noqa: E402
 from strategylab.data.fetch import update_all  # noqa: E402
 from strategylab.data.paths import locate  # noqa: E402
 
+sys.path.insert(0, str(HERE))
+from binance_account import binance_payload  # noqa: E402
+
 
 # ----------------------------------------------------------------------------
 # Background data refresh — incremental update of every dataset in data/.
@@ -1202,7 +1205,7 @@ class Handler(SimpleHTTPRequestHandler):
         route = parsed.path
 
         if route in ("/", "/chart", "/swarm", "/evolution",
-                     "/evolution/bots", "/evolution/bot", "/paper"):
+                     "/evolution/bots", "/evolution/bot", "/paper", "/binance"):
             # Serve the built React app (viewer/frontend) when present; fall
             # back to the legacy single-file pages so the viewer still works
             # without an `npm run build` (there, evolution is a tab on the
@@ -1280,6 +1283,9 @@ class Handler(SimpleHTTPRequestHandler):
 
         if route == "/api/paper":
             return self._send_json(paper_payload())
+
+        if route == "/api/binance":
+            return self._send_json(binance_payload())
 
         if route == "/api/files":
             return self._send_json(list_datasets())

@@ -637,3 +637,97 @@ export interface PaperPayload {
   state?: PaperState | null
   stale_s?: number
 }
+
+// ---- Binance account (read-only) -------------------------------------------
+
+export interface BinanceAssetRow {
+  asset: string
+  earn: boolean
+  free: number
+  locked: number
+  total: number
+  price_usd: number | null
+  value_usd: number | null
+}
+
+export interface BinanceWallet {
+  assets: BinanceAssetRow[]
+  value_usd: number
+  dust_hidden: number
+}
+
+export interface BinancePosition {
+  symbol: string
+  market?: string
+  side: string
+  contracts: number
+  notional: number
+  leverage: number
+  entry_price: number
+  mark_price: number
+  liq_price: number | null
+  unrealized_pnl: number
+  margin_mode: string | null
+}
+
+export interface BinanceFutures {
+  wallet_usd: number
+  unrealized_pnl: number
+  margin_balance_usd: number
+  available_usd: number
+  assets: { asset: string; wallet: number; unrealized_pnl: number; margin_balance: number }[]
+  positions: BinancePosition[]
+}
+
+export interface BinanceOrder {
+  symbol: string
+  market?: string
+  side: string
+  type: string
+  price: number | null
+  trigger?: number | null
+  amount: number
+  filled: number
+  reduce_only?: boolean
+  created_ms: number | null
+}
+
+export interface BinancePM {
+  assets: { asset: string; wallet: number; um_upnl: number; cm_upnl: number; value_usd: number | null }[]
+  value_usd: number
+  equity_usd: number
+  actual_equity_usd: number
+  uni_mmr: number | null
+  status: string | null
+  positions: BinancePosition[]
+  open_orders: BinanceOrder[]
+}
+
+export interface BinanceRestrictions {
+  ip_restrict: boolean
+  enable_reading: boolean
+  enable_spot_trading: boolean
+  enable_margin: boolean
+  enable_futures: boolean
+  enable_portfolio_margin: boolean
+  enable_withdrawals: boolean
+  enable_internal_transfer: boolean
+  permits_universal_transfer: boolean
+  created_ms: number
+}
+
+export interface BinancePayload {
+  configured: boolean
+  error?: string
+  generated_ms?: number
+  errors?: string[]
+  public_ip?: string | null
+  futures_off?: boolean
+  restrictions?: BinanceRestrictions | null
+  spot?: BinanceWallet | null
+  funding?: BinanceWallet | null
+  futures?: BinanceFutures | null
+  portfolio_margin?: BinancePM | null
+  open_orders?: BinanceOrder[] | null
+  total_value_usd?: number
+}

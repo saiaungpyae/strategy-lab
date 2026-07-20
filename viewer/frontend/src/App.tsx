@@ -6,6 +6,7 @@ import Evolution from './pages/evolution/Evolution'
 import EvoBots from './pages/evolution/EvoBots'
 import EvoBot from './pages/evolution/EvoBot'
 import Paper from './pages/paper/Paper'
+import Binance from './pages/binance/Binance'
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
         <Route path="/evolution/bots" element={<EvoBots />} />
         <Route path="/evolution/bot" element={<EvoBot />} />
         <Route path="/paper" element={<Paper />} />
+        <Route path="/binance" element={<Binance />} />
       </Routes>
     </BrowserRouter>
   )

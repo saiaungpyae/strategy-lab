@@ -120,6 +120,9 @@ export default function Dashboard() {
         <Link to="/paper" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
           paper trading →
         </Link>
+        <Link to="/binance" style={{ fontSize: '12.5px', color: 'var(--muted)' }}>
+          binance →
+        </Link>
         <span className="spacer" />
         <span className={'refresh-status' + (refresh?.state === 'running' ? ' busy' : '')}>
           {refreshText}

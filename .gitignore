@@ -36,6 +36,7 @@ htmlcov/
 # Leading slash anchors these to the repo root so src/strategylab/data/ (source) is unaffected.
 /data/
 /reports/
+/docs/
 
 # ---- Design & working docs (not source) ----
 *.pen
