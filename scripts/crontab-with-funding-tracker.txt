@@ -1,0 +1,3 @@
+# strategy-lab: pre-registered top_ls_pos forward tracking (see top-ls-forward-preregistration.md)
+# 1st of each month, 09:17 — refresh candle data, then re-score the frozen configs.
+17 9 1 * * cd /Users/sai/Documents/projects/crypto-2026 && echo "=== $(date) ===" >> reports/tracking/cron.log && .venv/bin/python -c "from pathlib import Path; from strategylab.data.fetch import update_all; update_all(Path('data'))" >> reports/tracking/cron.log 2>&1 && .venv/bin/python -m strategylab.swarm.run track >> reports/tracking/cron.log 2>&1 && .venv/bin/python -m strategylab.swarm.run track-funding >> reports/tracking/cron.log 2>&1

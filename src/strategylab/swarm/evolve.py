@@ -207,7 +207,8 @@ def cmd_evolve(args) -> None:
                              "--funding are mutually exclusive")
         args.file5, args.file15, args.metrics, args.funding = resolve_pair(
             pair, getattr(args, "data_root", "data"),
-            derivs=bool(getattr(args, "derivs", False)))
+            derivs=bool(getattr(args, "derivs", False)),
+            tape=getattr(args, "tape", "spot"))
     # candles/metrics/funding must agree on the asset even without --pair —
     # a mixed set merges on timestamp and silently produces garbage features
     pair = check_symbols(args.file5, args.file15, args.metrics,
@@ -262,6 +263,7 @@ def cmd_evolve(args) -> None:
             "taker_bps": args.taker_bps, "maker_bps": args.maker_bps,
             "since": args.since, "hof_per_gen": hof_n,
             "hof_metric": hof_metric, "pair": pair, "tfs": tf_names,
+            "tape": getattr(args, "tape", "spot"),
             "metrics_coverage": coverage,
             "metrics": args.metrics, "funding": args.funding}
     gen_stats = []
@@ -591,7 +593,9 @@ def cmd_evolve(args) -> None:
               "test_start": str(np.datetime64(int(test_t0), 'ms')),
               "maker_only": bool(args.maker_only), "taker_bps": args.taker_bps,
               "maker_bps": args.maker_bps, "since": args.since,
-              "pair": pair, "tfs": tf_names, "metrics_coverage": coverage,
+              "pair": pair, "tfs": tf_names,
+              "tape": getattr(args, "tape", "spot"),
+              "metrics_coverage": coverage,
               "metrics": args.metrics, "funding": args.funding,
               "hof_per_gen": hof_n, "hof_metric": hof_metric,
               "data": meta["data"],

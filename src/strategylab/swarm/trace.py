@@ -94,11 +94,16 @@ def trace_bot(rec: dict, feature_names: list[str], mkt: dict,
     return trades
 
 
-def _trace_window(w, ts_ms, p, thr, taker, edge, start_cap, ruin, label):
+def _trace_window(w, ts_ms, p, thr, taker, edge, start_cap, ruin, label,
+                  state_out: dict | None = None):
     """One window from clean state. Mirrors engine._bar_kernel branch-for-
     branch for a single non-control bot; python lists keep the scalar loop
     fast enough (~1s for the full 5m tape) and the whole thing is cached
-    server-side per (run, bot)."""
+    server-side per (run, bot).
+
+    With `state_out`, any position still open at the last bar is NOT closed;
+    the in-flight state (position, pending order, equity, reaction counters)
+    is written into the dict instead — the live paper trader's contract."""
     o = w["o"].tolist()
     h = w["h"].tolist()
     l = w["l"].tolist()  # noqa: E741 — mirrors the engine's naming
@@ -142,10 +147,12 @@ def _trace_window(w, ts_ms, p, thr, taker, edge, start_cap, ruin, label):
     dead = False
     entry_t = 0
     entry_raw = 0.0
+    trade_fund = 0.0   # net funding on the currently open trade (+ = received)
     trades: list[dict] = []
 
     def open_pos(t, raw, eff, at):
-        nonlocal pos, entry, qty, stop_px, tp_px, held, pk, entry_t, entry_raw
+        nonlocal pos, entry, qty, stop_px, tp_px, held, pk, entry_t, entry_raw, \
+            trade_fund
         d = float(pdir)
         dist = stop_atr * at
         q = eq * risk * rmult / dist if dist > 0.0 else float("inf")
@@ -161,15 +168,17 @@ def _trace_window(w, ts_ms, p, thr, taker, edge, start_cap, ruin, label):
         pk = 0
         entry_t = t
         entry_raw = raw
+        trade_fund = 0.0
 
     def close_pos(t, exit_raw, exit_eff, why):
         nonlocal pos, qty, held, cd, rmult, gap_until, eq, dead, pk
         pnl = qty * (exit_eff - entry) * pos
         eq += pnl
         tr = {"seg": label, "side": pos, "et": sec[entry_t],
-              "ep": round(entry_raw, 2), "xt": sec[t],
-              "xp": round(exit_raw, 2), "qty": round(qty, 6),
-              "pnl": round(pnl, 2), "why": why, "hold": held}
+              "ep": round(entry_raw, 6), "xt": sec[t],
+              "xp": round(exit_raw, 6), "qty": round(qty, 8),
+              "pnl": round(pnl, 4), "fund": round(trade_fund, 4),
+              "why": why, "hold": held}
         if pnl > 0:
             rmult = 1.0
         else:
@@ -228,7 +237,23 @@ def _trace_window(w, ts_ms, p, thr, taker, edge, start_cap, ruin, label):
         if pos != 0:
             held += 1
             if fund[t] != 0.0:                   # funding settles this bar
-                eq -= fund[t] * pos * qty * ct
+                pay = fund[t] * pos * qty * ct
+                eq -= pay
+                trade_fund -= pay
+
+    if state_out is not None:
+        state_out.update({
+            "pos": pos, "entry_eff": entry, "entry_raw": entry_raw,
+            "entry_sec": sec[entry_t] if pos != 0 else None,
+            "qty": qty, "stop_px": stop_px,
+            "tp_px": tp_px if np.isfinite(tp_px) else None,
+            "held": held, "trade_fund": round(trade_fund, 4),
+            "pending": pk, "pdir": pdir, "ppx": ppx, "pttl": pttl,
+            "cooldown": cd, "rmult": rmult,
+            "gap_left": max(0, gap_until - (n_bars - 1)),
+            "eq": eq, "dead": dead,
+        })
+        return trades
 
     # mark-to-market close of anything still open (taker at last close)
     if pos != 0:

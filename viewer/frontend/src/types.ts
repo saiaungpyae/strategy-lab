@@ -525,3 +525,115 @@ export interface EvoTradesPayload {
   trades: BotTrade[]
   note?: string
 }
+
+// ---- paper trading (reports/paper via /api/paper) --------------------------
+
+export interface PaperPosition {
+  side: 'LONG' | 'SHORT'
+  entry: number
+  entry_eff: number
+  qty: number
+  opened_sec: number | null
+  held_bars: number
+  stop_px: number
+  tp_px: number | null
+  liq_px: number | null
+  leverage: number
+  entry_cost: number
+  funding: number
+}
+
+export interface PaperPendingOrder {
+  side: 'LONG' | 'SHORT'
+  type: 'market' | 'limit'
+  px: number | null
+  ttl_bars: number
+}
+
+export interface PaperBot {
+  pair: string
+  label: string
+  bot_id: number
+  run_id: string
+  rules: string
+  tf: string
+  test_sharpe: number | null
+  maker_off_atr: number | null
+  order_ttl: number | null
+  triggers?: {
+    feature: string
+    op: '>' | '<'
+    dir: 'LONG' | 'SHORT'
+    need_q: number
+    thr: number
+    value: number | null
+    cur_q: number | null
+    fired: boolean
+  }[]
+  status: 'idle' | 'pending' | 'position' | 'dead'
+  equity: number
+  n_trades: number
+  realized_pnl: number
+  unrealized_pnl: number | null
+  mark: number | null
+  position?: PaperPosition
+  pending_order?: PaperPendingOrder
+  last_bar_sec?: number
+}
+
+export interface PaperTrade {
+  bot: string
+  pair: string
+  side: number
+  et: number
+  ep: number
+  xt: number
+  xp: number
+  qty: number
+  pnl: number
+  fund?: number
+  why: string
+  hold: number
+}
+
+export interface PaperState {
+  generated_ms: number
+  generated: string
+  paper_start_ms: number
+  interval_s: number
+  marks: Record<string, number>
+  errors: string[]
+  totals: {
+    bots: number
+    open_positions: number
+    equity: number
+    realized_pnl: number
+    unrealized_pnl: number
+  }
+  bots: PaperBot[]
+  trades: PaperTrade[]
+}
+
+export interface PaperRosterEntry {
+  pair: string
+  label: string
+  bot_id: number
+  run_id: string
+  seed: number | null
+  test_sharpe: number | null
+  born_gen: number | null
+  rules: string
+  stress: { key: string; label: string; ret_pct: number; maxdd_pct: number; trades: number; dead: boolean }[]
+}
+
+export interface PaperPayload {
+  error?: string
+  created?: string
+  tape?: 'spot' | 'perp'
+  paper_start_ms?: number
+  criteria?: string
+  start_capital?: number
+  roster?: PaperRosterEntry[]
+  state?: PaperState | null
+  stale_s?: number
+}

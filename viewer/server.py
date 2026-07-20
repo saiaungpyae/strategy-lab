@@ -665,6 +665,34 @@ def _list_pairs() -> list[dict]:
     return list(pairs.values())
 
 
+PAPER_DIR = HERE.parent / "reports" / "paper"
+
+
+def paper_payload() -> dict:
+    """Roster + live state written by the paper daemon (strategylab.paper).
+    The server only reads files — it never simulates (standing contract)."""
+    roster_f, state_f = PAPER_DIR / "roster.json", PAPER_DIR / "state.json"
+    if not roster_f.is_file():
+        return {"error": "no roster — run: python -m strategylab.paper select"}
+    roster = _read_json(roster_f) or {}
+    state = _read_json(state_f) if state_f.is_file() else None
+    out = {
+        "created": roster.get("created"),
+        "paper_start_ms": roster.get("paper_start_ms"),
+        "tape": roster.get("tape", "spot"),
+        "criteria": roster.get("criteria"),
+        "start_capital": roster.get("start_capital"),
+        "roster": [{k: b.get(k) for k in
+                    ("pair", "label", "bot_id", "run_id", "seed", "test_sharpe",
+                     "born_gen", "stress")} | {"rules": b["rec"].get("rules")}
+                   for b in roster.get("bots", [])],
+        "state": state,
+    }
+    if state:
+        out["stale_s"] = max(0, int(time.time() - state["generated_ms"] / 1000))
+    return out
+
+
 def swarm_evos_payload() -> dict:
     """Evolution runs: finished ones (evolution.json + top hall-of-fame rows)
     and in-flight ones (live progress.json written after every sim chunk)."""
@@ -1174,7 +1202,7 @@ class Handler(SimpleHTTPRequestHandler):
         route = parsed.path
 
         if route in ("/", "/chart", "/swarm", "/evolution",
-                     "/evolution/bots", "/evolution/bot"):
+                     "/evolution/bots", "/evolution/bot", "/paper"):
             # Serve the built React app (viewer/frontend) when present; fall
             # back to the legacy single-file pages so the viewer still works
             # without an `npm run build` (there, evolution is a tab on the
@@ -1249,6 +1277,9 @@ class Handler(SimpleHTTPRequestHandler):
                 bot = -1
             payload = swarm_bot_payload((q.get("id") or [""])[0], bot)
             return self._send_json(payload, 404 if "error" in payload else 200)
+
+        if route == "/api/paper":
+            return self._send_json(paper_payload())
 
         if route == "/api/files":
             return self._send_json(list_datasets())

@@ -31,20 +31,32 @@ _FUNDING_RE = re.compile(r"^(?P<base>[A-Z0-9]+)-USDT-USDT_funding\.csv$")
 
 def pair_dir(symbol: str) -> str:
     """Per-pair folder name from any symbol spelling:
-    'BTC', 'BTCUSDT', 'BTC-USDT', 'BTC/USDT', 'BTC/USDT:USDT' -> 'BTC-USDT'."""
+    'BTC', 'BTCUSDT', 'BTC-USDT', 'BTC/USDT', 'BTC/USDT:USDT' and the
+    sanitized perp form 'BTC-USDT-USDT' all -> 'BTC-USDT' (so a pair's spot
+    and perp tapes share one folder)."""
     base = re.split(r"[/:]", symbol.upper())[0]
-    for suffix in ("-USDT", "USDT"):
-        if base.endswith(suffix) and len(base) > len(suffix):
-            base = base[: -len(suffix)]
-            break
+    stripped = True
+    while stripped:
+        stripped = False
+        for suffix in ("-USDT", "USDT"):
+            if base.endswith(suffix) and len(base) > len(suffix):
+                base = base[: -len(suffix)]
+                stripped = True
+                break
     return f"{base}-USDT"
 
 
 def candles(pair: str, tf: str, exchange: str = "binance",
             root: Path | str = DATA_ROOT) -> Path:
-    """Canonical candle path: <root>/ohlcv/<PAIR>/<exchange>_<PAIR>_<tf>.csv"""
-    pair = pair_dir(pair)
-    return Path(root) / "ohlcv" / pair / f"{exchange}_{pair}_{tf}.csv"
+    """Canonical candle path: <root>/ohlcv/<PAIR>/<exchange>_<SYMBOL>_<tf>.csv
+
+    The directory is always the pair (spot and perp tapes share a folder);
+    the file name keeps the full sanitized symbol, so a perp tape reads
+    e.g. ohlcv/BTC-USDT/binanceusdm_BTC-USDT-USDT_15m.csv — same suffix
+    convention as the funding files."""
+    fname_sym = pair.upper().replace("/", "-").replace(":", "-")
+    return (Path(root) / "ohlcv" / pair_dir(pair)
+            / f"{exchange}_{fname_sym}_{tf}.csv")
 
 
 def metrics(pair: str, root: Path | str = DATA_ROOT) -> Path:

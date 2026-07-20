@@ -202,13 +202,21 @@ DATASET_RE = re.compile(r"^(?P<exchange>.+?)_(?P<symbol>.+?)_(?P<tf>[0-9]+[smhdw
 
 
 def parse_dataset_filename(path: Path) -> dict | None:
-    """binance_BTC-USDT_15m.csv -> {exchange, symbol, timeframe, format}."""
+    """binance_BTC-USDT_15m.csv -> {exchange, symbol, timeframe, format}.
+
+    Perp tapes keep the sanitized swap symbol in the name:
+    binanceusdm_BTC-USDT-USDT_15m.csv -> symbol BTC/USDT:USDT."""
     m = DATASET_RE.match(path.name)
     if not m:
         return None
+    sym = m["symbol"]
+    if sym.endswith("-USDT-USDT"):          # linear perp, ccxt unified form
+        sym = sym[: -len("-USDT-USDT")] + "/USDT:USDT"
+    else:
+        sym = sym.replace("-", "/")
     return {
         "exchange": m["exchange"],
-        "symbol": m["symbol"].replace("-", "/"),
+        "symbol": sym,
         "timeframe": m["tf"],
         "format": m["ext"],
     }

@@ -5,6 +5,7 @@ import Swarm from './pages/swarm/Swarm'
 import Evolution from './pages/evolution/Evolution'
 import EvoBots from './pages/evolution/EvoBots'
 import EvoBot from './pages/evolution/EvoBot'
+import Paper from './pages/paper/Paper'
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="/evolution" element={<Evolution />} />
         <Route path="/evolution/bots" element={<EvoBots />} />
         <Route path="/evolution/bot" element={<EvoBot />} />
+        <Route path="/paper" element={<Paper />} />
       </Routes>
     </BrowserRouter>
   )

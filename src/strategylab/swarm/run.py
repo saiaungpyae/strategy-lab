@@ -39,20 +39,28 @@ DEF_METRICS = datapaths.default_metrics()
 DEF_FUNDING = datapaths.default_funding()
 
 
-def resolve_pair(pair: str, root: str = "data",
-                 derivs: bool = False) -> tuple[str, str, str | None, str | None]:
+def resolve_pair(pair: str, root: str = "data", derivs: bool = False,
+                 tape: str = "spot") -> tuple[str, str, str | None, str | None]:
     """Resolve (file5, file15, metrics, funding) for a pair by the repo's
     naming convention. Candles live under ohlcv/<PAIR>/ in the canonical
     layout and flat at the root in snapshot / pre-migration dirs; metrics
-    under metrics/<PAIR>/, metrics/ or next to the candles — all checked."""
+    under metrics/<PAIR>/, metrics/ or next to the candles — all checked.
+    tape="perp" resolves the USDT-M tapes (binanceusdm_<PAIR>-USDT_*)
+    instead of spot; metrics/funding are perp-native either way."""
     r = Path(root)
     pdir = f"{pair}-USDT"
+    if tape == "perp":
+        stem = f"binanceusdm_{pdir}-USDT"
+    elif tape == "spot":
+        stem = f"binance_{pdir}"
+    else:
+        raise SystemExit(f"--tape must be spot or perp (got {tape!r})")
 
     def first(name: str, *dirs: Path) -> Path:
         return next((d / name for d in dirs if (d / name).is_file()), dirs[0] / name)
 
-    f5 = first(f"binance_{pdir}_5m.csv", r / "ohlcv" / pdir, r)
-    f15 = first(f"binance_{pdir}_15m.csv", r / "ohlcv" / pdir, r)
+    f5 = first(f"{stem}_5m.csv", r / "ohlcv" / pdir, r)
+    f15 = first(f"{stem}_15m.csv", r / "ohlcv" / pdir, r)
     metrics = funding = None
     if derivs:
         mname = f"{pair}USDT_metrics.csv"
@@ -77,7 +85,8 @@ def path_symbol(path: str | None) -> str | None:
     if not path:
         return None
     name = Path(path).name
-    for pat in (r"binance_([A-Z0-9]+)-USDT_", r"([A-Z0-9]+)USDT_metrics",
+    for pat in (r"binanceusdm_([A-Z0-9]+)-USDT-USDT_",
+                r"binance_([A-Z0-9]+)-USDT_", r"([A-Z0-9]+)USDT_metrics",
                 r"([A-Z0-9]+)-USDT-USDT_funding"):
         m = re.match(pat, name)
         if m:
@@ -392,6 +401,9 @@ def main() -> None:
     e.add_argument("--derivs", action="store_true",
                    help="with --pair: also wire the pair's metrics + funding "
                         "(derivative features and funding costs)")
+    e.add_argument("--tape", choices=["spot", "perp"], default="spot",
+                   help="with --pair: which candle tape to resolve — spot "
+                        "(binance_*) or USDT-M perp (binanceusdm_*)")
     e.add_argument("--tfs", default="5m,15m",
                    help="comma list of timeframes the gene pool may use "
                         "(subset of 5m,15m); excluded tapes skip their "
@@ -460,6 +472,8 @@ def main() -> None:
     _mirror.add_parser(sub)
     from . import track as _track
     _track.add_parser(sub)
+    from . import track_funding as _track_funding
+    _track_funding.add_parser(sub)
 
     dr = sub.add_parser("drift", help="feature level-drift report (stationarity guard)")
     dr.add_argument("--file", default=DEF_FILE15)

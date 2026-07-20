@@ -226,3 +226,140 @@ select:hover, button:hover { border-color: #3d444d; }
   border-radius: 6px; overflow: hidden;
 }
 .swarm .pbar i { display: block; height: 100%; background: var(--accent); transition: width .5s; }
+
+/* ---- paper trading page ---------------------------------------------- */
+.paper-totals { display: flex; gap: 18px; align-items: baseline; font-size: 13px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; flex-wrap: wrap; }
+.paper-totals b { font-size: 14px; }
+.paper-table { border-collapse: collapse; width: 100%; background: var(--panel);
+  font-size: 12.5px; }
+.paper-table th { text-align: left; color: var(--muted); font-weight: 500;
+  padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.paper-table td { padding: 5px 8px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; }
+.paper-rules { max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted); }
+.paper-open td { background: rgba(59, 130, 246, 0.05); }
+.paper-chip { display: inline-block; padding: 1px 8px; border-radius: 10px;
+  font-size: 11.5px; font-weight: 600; }
+.paper-chip.long    { background: rgba(38,166,154,0.15);  color: #26a69a; }
+.paper-chip.short   { background: rgba(239,83,80,0.15);   color: #ef5350; }
+.paper-chip.pending { background: rgba(240,180,41,0.15);  color: #f0b429; }
+.paper-chip.idle    { background: rgba(139,148,158,0.12); color: #8b949e; }
+.paper-chip.dead    { background: rgba(239,83,80,0.25);   color: #ef5350; }
+
+/* ---- paper page v2: tabs, chart, cards -------------------------------- */
+.paper-tabs { display: flex; gap: 8px; margin: 14px 0 4px; flex-wrap: wrap; }
+.paper-tab { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  color: var(--text); font-size: 13px; cursor: pointer; }
+.paper-tab.active { border-color: #3b82f6; background: rgba(59,130,246,0.10); }
+.paper-tab-open { background: #3b82f6; color: #fff; border-radius: 8px;
+  font-size: 10.5px; padding: 0 6px; font-weight: 700; }
+.paper-tab-pnl { font-size: 11px; }
+.paper-chart { height: 300px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); margin-bottom: 14px; overflow: hidden; }
+.paper-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px; }
+.paper-card { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column;
+  gap: 6px; font-size: 12.5px; }
+.paper-card.open { border-color: rgba(59,130,246,0.55); }
+.paper-card-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px;
+  font-weight: 600; }
+.paper-card-rules { color: var(--muted); font-size: 11.5px; line-height: 1.35;
+  max-height: 32px; overflow: hidden; }
+.paper-card-entrystyle { font-size: 10.5px; border-bottom: 1px solid var(--border);
+  padding-bottom: 6px; }
+.paper-pnl { display: flex; align-items: baseline; gap: 10px; font-size: 22px;
+  font-weight: 700; margin: 2px 0; }
+.paper-roe { font-size: 12px; font-weight: 600; }
+.paper-row { display: flex; justify-content: space-between; gap: 10px; }
+.paper-order { border: 1px dashed rgba(240,180,41,0.5); border-radius: 8px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 5px; }
+.paper-order-side { font-weight: 700; font-size: 13px; }
+.paper-idle { padding: 14px 0; text-align: center; font-size: 12px; }
+.paper-card-foot { display: flex; gap: 12px; flex-wrap: wrap; margin-top: auto;
+  padding-top: 8px; border-top: 1px solid var(--border); font-size: 11.5px;
+  color: var(--muted); }
+.paper-card-foot b { color: var(--text); }
+
+/* daemon heartbeat: quiet green pulse while healthy; text only when stale */
+.paper-heartbeat { width: 9px; height: 9px; border-radius: 50%;
+  background: #26a69a; display: inline-block; cursor: help;
+  animation: paper-pulse 2.4s ease-in-out infinite; }
+@keyframes paper-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(38,166,154,0.45); }
+  50% { opacity: 0.7; box-shadow: 0 0 0 5px rgba(38,166,154,0); }
+}
+
+/* trigger proximity meters */
+.paper-triggers { display: flex; flex-direction: column; gap: 6px; padding: 6px 0; }
+.paper-trig { display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; font-size: 11.5px; }
+.paper-trig-rule { color: var(--muted); }
+.paper-trig-gap { display: inline-flex; align-items: center; gap: 6px;
+  white-space: nowrap; font-size: 11px; }
+.paper-trig-bar { width: 52px; height: 5px; border-radius: 3px;
+  background: var(--border); overflow: hidden; display: inline-block; }
+.paper-trig-bar i { display: block; height: 100%; background: #3b82f6;
+  border-radius: 3px; }
+.paper-trig-fired { color: #f0b429; font-weight: 700; font-size: 11px;
+  animation: paper-pulse 1.6s ease-in-out infinite; }
+
+/* ---- paper card v3 (pencil-inspired) ---------------------------------- */
+.paper-num { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace; }
+.paper-card { gap: 10px; }
+.paper-card.open { box-shadow: 0 0 18px rgba(59,130,246,0.21); }
+.paper-card.dead { opacity: 0.72; }
+.paper-card-id { display: flex; flex-direction: column; gap: 2px; }
+.paper-card-id .paper-num { font-size: 11px; font-weight: 400; }
+.paper-card-rules, .paper-card-entrystyle, .paper-trig-rule, .paper-trig-prox,
+.paper-order-meta, .paper-card-foot, .paper-row span:last-child {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace; }
+.paper-chip { font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600;
+  font-size: 10.5px; padding: 3px 9px; border-radius: 999px; }
+.paper-eyebrow { font-size: 9px; letter-spacing: 1px; color: var(--muted);
+  font-weight: 600; text-transform: uppercase; }
+.paper-hero { display: flex; justify-content: space-between; align-items: flex-end;
+  width: 100%; padding: 11px 13px; background: #1c222b; border-radius: 8px;
+  border-left: 2px solid #26a69a; box-sizing: border-box; }
+.paper-hero-big { font-size: 28px; font-weight: 600; line-height: 1.1;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.paper-hero-right { text-align: right; }
+.paper-hero-roe { font-size: 15px; font-weight: 600;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.paper-stats { width: 100%; display: flex; flex-direction: column; }
+.paper-stats .paper-row { padding: 5px 0; border-bottom: 1px solid var(--border); }
+.paper-stats .paper-row:last-child { border-bottom: none; }
+.paper-order { border: none; border-left: 2px solid #f0b429; background: #1c222b;
+  border-radius: 6px; padding: 10px; width: 100%; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 6px; }
+.paper-order-top { display: flex; justify-content: space-between; align-items: center; }
+.paper-order-side { font-weight: 600; font-size: 12px;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.paper-order-px { font-size: 13px; font-weight: 600; color: var(--text); }
+.paper-order-meta { font-size: 11px; }
+.paper-radar { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.paper-radar.dim { opacity: 0.55; }
+.paper-trig { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+.paper-trig-top { display: flex; justify-content: space-between;
+  align-items: center; gap: 8px; }
+.paper-trig-rule { color: var(--text); font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.paper-trig-dir { font-size: 10px; font-weight: 600; }
+.paper-trig-prox { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.paper-trig-track { width: 100%; height: 5px; border-radius: 999px;
+  background: #21262d; overflow: hidden; }
+.paper-trig-track i { display: block; height: 100%; border-radius: 999px; }
+.paper-trig-track .fill { background: #3b82f6; }
+.paper-trig-track .fill-fired { background: #f0b429; }
+.paper-trig-track .fill-pos { background: #26a69a; }
+.paper-halted { background: rgba(139,148,158,0.15); border-radius: 6px;
+  padding: 7px 10px; font-size: 10px; width: 100%; box-sizing: border-box; }
+.paper-card-foot { display: block; font-size: 11px; }
+.paper-card-head { justify-content: space-between; }
+.paper-trig-top .paper-trig-rule { margin-right: auto; }
+.paper-trig { align-items: stretch; justify-content: flex-start; }
